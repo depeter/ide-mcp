@@ -151,16 +151,27 @@ How it behaves:
 ### Android projects
 
 Android import in the language server is experimental, and one defect matters in practice:
-modules that enable `buildConfig`, `viewBinding` or `dataBinding` fail to import with AGP 8.13
-([Kotlin/kotlin-lsp#253](https://github.com/Kotlin/kotlin-lsp/issues/253)). In a single-module
-app that takes the whole project with it.
+modules that enable `buildConfig`, `viewBinding` or `dataBinding` fail to import
+([Kotlin/kotlin-lsp#253](https://github.com/Kotlin/kotlin-lsp/issues/253), seen with AGP 8.13).
+In a single-module app that takes the whole project with it.
 
-The tools detect a failed or partial import and never answer from an incomplete model:
-`find_usages` falls back to text matching with a note, `rename_symbol` shows the text-based
-preview and writes nothing unless you ask for `engine="text"`, and `symbol_info` and
-`file_problems` return the reason. `compile`, `detekt` and `ktlint` are unaffected. Once a
-language server release fixes the import, install it with
-`kotlin-mcp --install-lsp <version>` and the code-aware path takes over.
+The `kotlin` server works around it by itself. When an import fails that way, it imports again
+with the Android test components that caused it switched off, and remembers that for the
+project, so only the first call pays for two imports. Nothing in the project or in
+`~/.gradle` is changed: the switch is a Gradle init script handed to the language server's
+import alone, and ordinary builds never see it.
+
+The price is that the sources of those components, normally `src/androidTest`, are invisible
+to the code-aware tools: `find_usages` and `rename_symbol` do not look there and say so in
+their output when the project has such sources, and `file_problems` and `symbol_info` refuse
+files in them. Unit tests under `src/test` stay visible unless they too break the import. Run
+`compile` after a rename to catch anything missed in instrumented tests. Set
+`KOTLIN_LSP_ANDROID_WORKAROUND=0` to switch the workaround off.
+
+If an import still fails, the tools never answer from an incomplete model: `find_usages` falls
+back to text matching with a note, `rename_symbol` shows the text-based preview and writes
+nothing unless you ask for `engine="text"`, and `symbol_info` and `file_problems` return the
+reason. `compile`, `detekt` and `ktlint` are unaffected either way.
 
 ## Compared with the JetBrains MCP server
 
@@ -183,8 +194,8 @@ Where this differs from the IDE:
   `find_usages` and `rename_symbol` use the same engine as the IDE. Without it, problems come
   from the compiler and detekt only, and usages and renames are whole-word text matches that
   cannot tell apart two symbols with the same name.
-- **Android projects may not import** in the language server yet (see above), in which case
-  the text-based behaviour applies there.
+- **Android instrumented tests may be left out.** Where the language server's Android import
+  needs the workaround above, `src/androidTest` is not covered by the code-aware tools.
 - **The language server covers Kotlin best.** Java files are analysed too, but its documented
   diagnostics and quick fixes are for Kotlin.
 - **Quick fixes are listed, not applied.** `file_problems` names the fixes the IDE would offer;
@@ -200,6 +211,7 @@ Where this differs from the IDE:
 | `DETEKT_CLI`, `KTLINT_CLI` | kotlin | Explicit path to the fallback CLI binaries |
 | `KOTLIN_LSP_PATH` | kotlin | Use an existing Kotlin language server (its `intellij-server` launcher or install directory) |
 | `KOTLIN_LSP_IDLE_MINUTES` | kotlin | Stop a project's language server after this long unused. Default 30 |
+| `KOTLIN_LSP_ANDROID_WORKAROUND` | kotlin | `0` disables the automatic workaround for the Android import defect |
 | `IJ_JAVA_OPTIONS` | kotlin | JVM options for the language server, e.g. `-Xmx4g` |
 
 `run_command`, `gradle_run`, `delete_path` and `rename_symbol` can change or remove things and

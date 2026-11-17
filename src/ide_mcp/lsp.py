@@ -293,6 +293,77 @@ class LspError(ToolError):
 
 _TOO_EARLY = re.compile(r"before task '(:[^']+)' has completed is not supported")
 
+# ---- workaround for Kotlin/kotlin-lsp#253
+#
+# The importer reads the generated-source directories of Android test components before the
+# tasks producing them have run, which fails the whole import. Turning those components off for
+# the import avoids it, at the price of their sources being invisible to the language server.
+# The script reaches Gradle only through the server's own init-script property, so ordinary
+# builds never see it.
+
+WORKAROUND_ENV = "KOTLIN_LSP_ANDROID_WORKAROUND"  # "0" disables it
+INIT_SCRIPTS_PROPERTY = "com.jetbrains.ls.imports.gradle.init.scripts"
+_COMPONENT_SOURCES = {"androidTest": "src/androidTest", "unitTest": "src/test"}
+_DISABLE = {
+    "androidTest": (
+        "try { variant.enableAndroidTest = false } catch (Throwable e1) {\n"
+        "                        try { variant.androidTest.enable = false } catch (Throwable e2) {}\n"
+        "                    }"
+    ),
+    "unitTest": (
+        "try { variant.enableUnitTest = false } catch (Throwable e1) {\n"
+        "                        try { variant.hostTests.values().each { it.enable = false } } catch (Throwable e2) {}\n"
+        "                    }"
+    ),
+}
+
+
+def workaround_enabled() -> bool:
+    return os.environ.get(WORKAROUND_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def components_to_disable(broken_tasks: set[str]) -> frozenset[str]:
+    """Which Android test components the tasks named in a failed import belong to."""
+    out = set()
+    for task in broken_tasks:
+        name = task.rsplit(":", 1)[-1]
+        if "AndroidTest" in name:
+            out.add("androidTest")
+        elif "UnitTest" in name:
+            out.add("unitTest")
+    return frozenset(out)
+
+
+def init_script_text(components: frozenset[str]) -> str:
+    body = "\n                    ".join(_DISABLE[c] for c in sorted(components))
+    return f"""// Written by ide-mcp for the Kotlin language server's project import only.
+// Works around https://github.com/Kotlin/kotlin-lsp/issues/253 by leaving out: {", ".join(sorted(components))}
+gradle.allprojects {{ project ->
+    ['com.android.application', 'com.android.library', 'com.android.dynamic-feature'].each {{ id ->
+        project.pluginManager.withPlugin(id) {{
+            def components = project.extensions.findByName('androidComponents')
+            if (components != null) {{
+                components.beforeVariants(components.selector().all()) {{ variant ->
+                    {body}
+                }}
+            }}
+        }}
+    }}
+}}
+"""
+
+
+def _read_marker(system: Path) -> frozenset[str]:
+    try:
+        names = (system / "ide-mcp-import-workaround").read_text(encoding="utf-8").split(",")
+    except OSError:
+        return frozenset()
+    return frozenset(n.strip() for n in names if n.strip() in _DISABLE)
+
+
+def _write_marker(system: Path, components: frozenset[str]) -> None:
+    (system / "ide-mcp-import-workaround").write_text(",".join(sorted(components)), encoding="utf-8")
+
 
 @dataclass
 class Session:
@@ -309,6 +380,8 @@ class Session:
     import_error: str = ""  # Gradle's "What went wrong" for a failed import
     broken_tasks: set[str] = field(default_factory=set)  # tasks whose module imported without sources
     _after_went_wrong: bool = False
+    workaround: frozenset[str] = frozenset()  # Android test components left out of the import
+    init_script: Path | None = None
     progress: dict[str, str] = field(default_factory=dict)
     last_activity: str = "starting"
     quiet_since: float = field(default_factory=time.time)
@@ -499,6 +572,10 @@ class Session:
             " This is a known defect of the language server's Android import for modules that enable "
             "buildConfig, viewBinding or dataBinding (https://github.com/Kotlin/kotlin-lsp/issues/253)."
         )
+        if self.workaround:
+            known += f" Leaving out {' and '.join(sorted(self.workaround))} components did not get around it."
+        elif self.broken_tasks and not workaround_enabled():
+            known += f" The workaround for it is switched off ({WORKAROUND_ENV})."
         if self.import_status and self.import_status != "SUCCESS":
             return (
                 f"the Kotlin language server could not import {self.root} (status {self.import_status})."
@@ -507,6 +584,38 @@ class Session:
         if modules:
             return f"the Kotlin language server imported {self.root} without the sources of {', '.join(modules)}." + known
         return ""
+
+    def caveat(self) -> str:
+        """A note for results when part of the project was deliberately left out of the import."""
+        hidden = set(self.workaround)
+        # Say nothing about instrumented tests in a project that has none.
+        if not any(self.left_out(Path(p)) for p in self._mtimes or {}):
+            hidden.discard("androidTest")
+        if not hidden:
+            return ""
+        dirs = " and ".join(_COMPONENT_SOURCES[c] for c in sorted(hidden))
+        return (
+            f"[Android modules were imported without {dirs} (workaround for Kotlin/kotlin-lsp#253): "
+            "code there is not analysed, searched or renamed]\n"
+        )
+
+    def left_out(self, path: Path) -> bool:
+        """Whether `path` is an Android instrumented-test source the import workaround dropped."""
+        if "androidTest" not in self.workaround:
+            return False
+        parts = path.parts
+        return any(a == "src" and b.startswith("androidTest") for a, b in zip(parts, parts[1:]))
+
+    def write_init_script(self) -> None:
+        """(Re)create the import init script. The server deletes it after every import, and a
+        later re-import (a build file changed) needs it again."""
+        if self.init_script is None or self.init_script.exists():
+            return
+        try:
+            self.init_script.parent.mkdir(parents=True, exist_ok=True)
+            self.init_script.write_text(init_script_text(self.workaround), encoding="utf-8")
+        except OSError:
+            pass
 
     async def stop(self) -> None:
         if self.alive:
@@ -536,6 +645,7 @@ class Session:
     async def sync(self) -> None:
         """Tell the server about files that changed on disk since the last call. Agents edit
         files behind its back, so nothing else would."""
+        self.write_init_script()
         current = await asyncio.to_thread(self._scan)
         if self._mtimes is not None:
             events = []
@@ -608,44 +718,75 @@ async def session_for(root: Path, timeout: float = 600.0, on_status: Callable[[s
     if launcher is None:
         raise LspError(NOT_INSTALLED)
     key = path_key(root)
-    async with _start_locks.setdefault(key, asyncio.Lock()):
-        s = _sessions.get(key)
-        if s is None or not s.alive:
-            system = cache_dir() / "lsp" / hashlib.sha256(key.encode()).hexdigest()[:16]
-            system.mkdir(parents=True, exist_ok=True)
-            argv = [str(launcher), "--stdio", f"--system-path={system}"]
-            if WINDOWS and launcher.suffix.lower() in (".bat", ".cmd"):
-                argv = ["cmd.exe", "/c", *argv]
-            kwargs: dict[str, Any] = {"start_new_session": True} if not WINDOWS else {}
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    cwd=str(root),
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    limit=16 * 1024 * 1024,
-                    **kwargs,
-                )
-            except OSError as e:
-                raise LspError(f"Could not start the Kotlin language server at {launcher}: {e}") from None
-            s = Session(root=root, proc=proc)
-            _sessions[key] = s
-            try:
-                await s.initialize()
-            except LspError:
-                _sessions.pop(key, None)
-                await s.stop()
-                raise
-            if _reaper is None or _reaper.done():
-                _reaper = asyncio.create_task(_reap_idle())
-    s.last_used = time.time()
-    waiter = asyncio.create_task(s.wait_ready(timeout))
-    while not waiter.done():
+    system = cache_dir() / "lsp" / hashlib.sha256(key.encode()).hexdigest()[:16]
+    deadline = time.time() + timeout
+    while True:
+        async with _start_locks.setdefault(key, asyncio.Lock()):
+            s = _sessions.get(key)
+            if s is None or not s.alive:
+                s = await _start(root, launcher, system)
+                _sessions[key] = s
+                try:
+                    await s.initialize()
+                except LspError:
+                    _sessions.pop(key, None)
+                    await s.stop()
+                    raise
+                if _reaper is None or _reaper.done():
+                    _reaper = asyncio.create_task(_reap_idle())
+        s.last_used = time.time()
+        waiter = asyncio.create_task(s.wait_ready(max(deadline - time.time(), 1.0)))
+        while not waiter.done():
+            if on_status:
+                on_status(f"Kotlin language server: {s.last_activity}")
+            await asyncio.wait([waiter], timeout=2)
+        await waiter
+        # Kotlin/kotlin-lsp#253: import again without the test components that broke it. The
+        # choice is remembered per project, so this double import happens once.
+        extra = components_to_disable(s.broken_tasks) - s.workaround
+        if not extra or not workaround_enabled():
+            return s
+        _write_marker(system, s.workaround | extra)
         if on_status:
-            on_status(f"Kotlin language server: {s.last_activity}")
-        await asyncio.wait([waiter], timeout=2)
-    await waiter
+            on_status(f"Kotlin language server: importing again without {', '.join(sorted(extra))} components")
+        if _sessions.get(key) is s:
+            _sessions.pop(key, None)
+        await s.stop()
+
+
+async def _start(root: Path, launcher: Path, system: Path) -> Session:
+    system.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    workaround = _read_marker(system) if workaround_enabled() else frozenset()
+    script: Path | None = None
+    if workaround:
+        script = system / "ide-mcp-import.gradle"
+        option = f"-D{INIT_SCRIPTS_PROPERTY}={script}"
+        if any(ch.isspace() for ch in option):
+            # The launcher splits IJ_JAVA_OPTIONS on whitespace. The server resolves a relative
+            # path against its working directory, the project root, whose .gradle is scratch space.
+            script = root / ".gradle" / "ide-mcp-import.gradle"
+            option = f"-D{INIT_SCRIPTS_PROPERTY}=.gradle/ide-mcp-import.gradle"
+        env["IJ_JAVA_OPTIONS"] = " ".join(filter(None, [env.get("IJ_JAVA_OPTIONS", "").strip(), option]))
+    argv = [str(launcher), "--stdio", f"--system-path={system}"]
+    if WINDOWS and launcher.suffix.lower() in (".bat", ".cmd"):
+        argv = ["cmd.exe", "/c", *argv]
+    kwargs: dict[str, Any] = {"start_new_session": True} if not WINDOWS else {}
+    s = Session(root=root, proc=None, workaround=workaround, init_script=script)  # type: ignore[arg-type]
+    s.write_init_script()
+    try:
+        s.proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(root),
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            limit=16 * 1024 * 1024,
+            **kwargs,
+        )
+    except OSError as e:
+        raise LspError(f"Could not start the Kotlin language server at {launcher}: {e}") from None
     return s
 
 

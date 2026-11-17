@@ -866,6 +866,14 @@ async def _session(ctx: Context | None, root: Path, timeout: float = 600.0) -> l
     return s
 
 
+def _require_imported(s: lsp.Session, path: Path) -> None:
+    if s.left_out(path):
+        raise lsp.LspError(
+            f"{path} was left out of the language server's import (workaround for Kotlin/kotlin-lsp#253 "
+            "on Android test sources), so it cannot be analysed. Use compile or detekt for it."
+        )
+
+
 async def _session_or_text(ctx: Context | None, root: Path, engine: str) -> tuple[lsp.Session | None, str]:
     """For tools with a text fallback: the session, or None plus a note saying why text matching
     is used instead. engine='semantic' never falls back."""
@@ -1000,9 +1008,9 @@ async def find_usages(
             continue
         by_file.setdefault(shown, []).append((ln + 1, {"usage": " ", "declaration": "D", "import": "I"}[kind], text))
     if not refs:
-        return f"No references to '{name}' found by the language server in {s.root}."
+        return s.caveat() + f"No references to '{name}' found by the language server in {s.root}."
     out = [
-        f"'{name}' in {s.root}: {counts['usage']} usage(s), {counts['declaration']} declaration(s), {counts['import']} import(s) "
+        s.caveat() + f"'{name}' in {s.root}: {counts['usage']} usage(s), {counts['declaration']} declaration(s), {counts['import']} import(s) "
         f"across {len(by_file)} file(s).  [code-aware; D = declaration" + (", I = import" if include_imports else "") + "]"
     ]
     shown_lines = 0
@@ -1094,7 +1102,7 @@ async def rename_symbol(
 
     total = sum(len(c.changed_lines()) for c in changes)
     verb = "Would rename" if dry_run else "Renamed"
-    out = [f"{verb} '{name}' to '{new_name}': {total} line(s) in {len(changes)} file(s) under {s.root}.  [code-aware]"]
+    out = [s.caveat() + f"{verb} '{name}' to '{new_name}': {total} line(s) in {len(changes)} file(s) under {s.root}.  [code-aware]"]
     budget = 150
     for c in sorted(changes, key=lambda c: str(c.path)):
         lines = c.changed_lines()
@@ -1141,6 +1149,7 @@ async def symbol_info(
     async with s.lock:
         await s.sync()
         path, pos = await _locate(s, name, file, line, column)
+        _require_imported(s, path)
         doc = {"textDocument": {"uri": lsp.uri_of(path)}, "position": pos}
         hover = await s.request("textDocument/hover", doc)
         decls = await s.request("textDocument/definition", doc) or []
@@ -1178,6 +1187,7 @@ async def file_problems(
     path = _source(file)
     assert path is not None
     s = await _session(ctx, _workspace_root(None, file))
+    _require_imported(s, path)
     async with s.lock:
         await s.sync()
         s.open(path)

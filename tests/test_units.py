@@ -424,3 +424,39 @@ def test_session_reports_partial_import(tmp_path: Path):
     s._handle({"method": "intellij/importLog", "params": {"message": "Querying the mapped value of x before task ':app:generateDebugAndroidTestBuildConfig' has completed is not supported"}})
     s._handle({"method": "intellij/workspaceImportState", "params": {"phase": "FINISHED", "folders": [{"status": "SUCCESS"}]}})
     assert ":app" in s.unreliable() and "issues/253" in s.unreliable()
+
+
+def test_lsp_import_workaround(tmp_path, monkeypatch):
+    from ide_mcp import lsp
+
+    assert lsp.components_to_disable({":app:generateDebugAndroidTestBuildConfig"}) == {"androidTest"}
+    assert lsp.components_to_disable({":lib:generateDebugUnitTestProto", ":app:dataBindingGenBaseClassesDebugAndroidTest"}) == {"androidTest", "unitTest"}
+    assert lsp.components_to_disable({":app:compileDebugKotlin"}) == frozenset()
+
+    text = lsp.init_script_text(frozenset({"androidTest"}))
+    assert "enableAndroidTest = false" in text and "enableUnitTest" not in text
+    assert text.count("{") == text.count("}")
+
+    lsp._write_marker(tmp_path, frozenset({"androidTest", "unitTest"}))
+    assert lsp._read_marker(tmp_path) == {"androidTest", "unitTest"}
+    assert lsp._read_marker(tmp_path / "missing") == frozenset()
+
+    script = tmp_path / "sub" / "import.gradle"
+    s = lsp.Session(root=tmp_path, proc=None, workaround=frozenset({"androidTest"}), init_script=script)  # type: ignore[arg-type]
+    s.write_init_script()
+    assert "enableAndroidTest" in script.read_text()
+    script.unlink()  # the server deletes it after each import
+    s.write_init_script()
+    assert script.exists()
+    assert s.caveat() == ""  # no instrumented tests seen in the project
+    s._mtimes = {str(tmp_path / "app/src/androidTest/kotlin/A.kt"): 1.0}
+    assert "src/androidTest" in s.caveat()
+    assert s.left_out(tmp_path / "app/src/androidTestDebug/kotlin/A.kt")
+    assert not s.left_out(tmp_path / "app/src/main/kotlin/androidTest/A.kt")
+
+    s.broken_tasks.add(":app:generateDebugAndroidTestBuildConfig")
+    assert "did not get around it" in s.unreliable()
+    monkeypatch.setenv(lsp.WORKAROUND_ENV, "0")
+    plain = lsp.Session(root=tmp_path, proc=None)  # type: ignore[arg-type]
+    plain.broken_tasks.add(":app:generateDebugAndroidTestBuildConfig")
+    assert "switched off" in plain.unreliable()
