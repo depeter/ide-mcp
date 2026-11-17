@@ -17,6 +17,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from .common import (
+    WINDOWS,
     ToolError,
     allowed_roots,
     clip,
@@ -33,7 +34,7 @@ mcp = FastMCP(
     "files",
     instructions=(
         "File tools that work on any path on this machine; nothing needs to be opened in an IDE "
-        "first. Pass absolute paths (or ~/...). Relative paths resolve against the directory the "
+        "first. Pass absolute paths (or ~/...); on Windows both C:\\dir\\file and C:/dir/file work. Relative paths resolve against the directory the "
         "server was started in, which may not be your project, so prefer absolute ones.\n"
         "Search and listing tools take a `root` directory and honour .gitignore inside git "
         "repositories; elsewhere they skip build and cache directories. Pass include_ignored=true "
@@ -463,16 +464,31 @@ async def git_status(
     return "\n\n".join(blocks)
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+def _shell() -> tuple[str, list[str]]:
+    """Shell used by run_command: bash on POSIX, PowerShell on Windows."""
+    if not WINDOWS:
+        return "bash", ["bash", "-c"]
+    exe = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+    return "PowerShell", [exe, "-NoProfile", "-NonInteractive", "-Command"]
+
+
+SHELL_NAME, SHELL_ARGV = _shell()
+
+
+@mcp.tool(
+    annotations=DESTRUCTIVE,
+    description=(
+        f"Run a {SHELL_NAME} command and return its exit code and combined output. For Gradle, "
+        "detekt and ktlint prefer the kotlin server's tools, which summarise the results."
+    ),
+)
 async def run_command(
-    command: Annotated[str, Field(description="Command line, run with bash -c.")],
+    command: Annotated[str, Field(description=f"Command line, run with {SHELL_NAME}.")],
     cwd: Annotated[str | None, Field(description="Absolute working directory. Defaults to the server's start directory.")] = None,
     timeout_sec: Annotated[int, Field(description="Kill the command after this many seconds.", ge=1, le=3600)] = 120,
 ) -> str:
-    """Run a shell command and return its exit code and combined output. For Gradle, detekt and
-    ktlint prefer the kotlin server's tools, which summarise the results."""
     workdir = existing_dir(cwd, "Working directory")
-    r = await run_proc(["bash", "-c", command], cwd=workdir, timeout=timeout_sec)
+    r = await run_proc([*SHELL_ARGV, command], cwd=workdir, timeout=timeout_sec)
     status = f"timed out after {timeout_sec}s and was killed" if r.timed_out else f"exit code {r.code}"
     return f"[{status}] (cwd: {workdir})\n" + clip(r.output.rstrip("\n") or "(no output)")
 

@@ -9,11 +9,11 @@ import re
 import shutil
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from .common import SKIP_DIRS, ToolError, clip, rel, resolve, run_proc
+from .common import SKIP_DIRS, WINDOWS, ToolError, android_sdk, clip, path_key, rel, resolve, run_proc
 
 SETTINGS = ("settings.gradle.kts", "settings.gradle")
 BUILD_FILES = ("build.gradle.kts", "build.gradle")
@@ -33,16 +33,22 @@ class GradleProject:
     root: Path
     launcher: tuple[str, ...]
 
-    @property
-    def uses_wrapper(self) -> bool:
-        return self.launcher[0].endswith("gradlew")
+
+
+def _has_wrapper(root: Path) -> bool:
+    return (root / ("gradlew.bat" if WINDOWS else "gradlew")).is_file()
 
 
 def _launcher(root: Path) -> tuple[str, ...] | None:
-    wrapper = root / "gradlew"
-    if wrapper.is_file():
-        # Run through sh so a wrapper checked in without the executable bit still works.
-        return (str(wrapper),) if os.access(wrapper, os.X_OK) else ("sh", str(wrapper))
+    if WINDOWS:
+        wrapper = root / "gradlew.bat"
+        if wrapper.is_file():
+            return (str(wrapper),)
+    else:
+        wrapper = root / "gradlew"
+        if wrapper.is_file():
+            # Run through sh so a wrapper checked in without the executable bit still works.
+            return (str(wrapper),) if os.access(wrapper, os.X_OK) else ("sh", str(wrapper))
     system = shutil.which("gradle")
     return (system,) if system else None
 
@@ -63,7 +69,7 @@ def find_project(path: str | None) -> GradleProject:
 
     with_settings = [d for d in (start, *start.parents) if _has(d, SETTINGS)]
     for d in with_settings:
-        if (d / "gradlew").is_file():
+        if _has_wrapper(d):
             return GradleProject(d, _launcher(d))  # type: ignore[arg-type]
     for d in with_settings or [d for d in (start, *start.parents) if _has(d, BUILD_FILES)]:
         launcher = _launcher(d)
@@ -161,10 +167,8 @@ _locks: dict[Path, asyncio.Lock] = {}
 def _gradle_env() -> dict[str, str]:
     env = dict(os.environ)
     env.setdefault("TERM", "dumb")
-    if "ANDROID_HOME" not in env and "ANDROID_SDK_ROOT" not in env:
-        sdk = Path.home() / "Android" / "Sdk"
-        if sdk.is_dir():
-            env["ANDROID_HOME"] = str(sdk)
+    if "ANDROID_HOME" not in env and "ANDROID_SDK_ROOT" not in env and (sdk := android_sdk()):
+        env["ANDROID_HOME"] = sdk
     return env
 
 
@@ -307,6 +311,10 @@ class Diagnostic:
     message: str
     rule: str = ""
 
+    @property
+    def key(self) -> str:
+        return path_key(self.path)
+
     def render(self, root: Path) -> str:
         loc = rel(Path(self.path), root) + (f":{self.line}" if self.line else "") + (f":{self.col}" if self.col else "")
         return f"{loc}: {self.message}" + (f" [{self.rule}]" if self.rule else "")
@@ -329,19 +337,22 @@ class Report:
         return [d for d in self.diagnostics if d.severity == "warning"]
 
 
-# kotlinc (K1 and K2): "e: file:///abs/File.kt:12:5 Unresolved reference 'x'."
-_KOTLINC = re.compile(r"^(e|w): (?:\[ksp\] )?(?:file://)?(/[^:\n]+?):(\d+):(?:(\d+):?)? ?(.*)$")
+# An absolute path as tools print it: /abs/File.kt, C:\abs\File.kt or C:/abs/File.kt.
+_P = r"(?:[A-Za-z]:[\\/]|/)[^:\n]+"
+# kotlinc (K1 and K2): "e: file:///abs/File.kt:12:5 Unresolved reference 'x'." On Windows the
+# URL form is file:///C:/abs/File.kt, so the slash before the drive letter is not part of the path.
+_KOTLINC = re.compile(rf"^(e|w): (?:\[ksp\] )?(?:file:///(?=[A-Za-z]:)|file://)?({_P}?):(\d+):(?:(\d+):?)? ?(.*)$")
 # javac: "/abs/File.java:12: error: cannot find symbol"
 # kotlinc before 1.8: "e: /abs/File.kt: (7, 9): Type mismatch"
-_KOTLINC_OLD = re.compile(r"^(e|w): (/[^:\n]+): \((\d+), (\d+)\): (.*)$")
-_JAVAC = re.compile(r"^(/[^:\n]+\.java):(\d+): (error|warning): (.*)$")
+_KOTLINC_OLD = re.compile(rf"^(e|w): ({_P}): \((\d+), (\d+)\): (.*)$")
+_JAVAC = re.compile(rf"^({_P}\.java):(\d+): (error|warning): (.*)$")
 # detekt: "/abs/File.kt:12:5: Message text [RuleName]"
-_DETEKT = re.compile(r"^(/[^:\n]+):(\d+):(\d+): (.+) \[(\w+)\]$")
+_DETEKT = re.compile(rf"^({_P}):(\d+):(\d+): (.+) \[(\w+)\]$")
 # ktlint CLI and Gradle plugins: "/abs/File.kt:3:1: Unused import (standard:no-unused-imports)"
-_KTLINT = re.compile(r"^(/[^:\n]+):(\d+):(\d+):? (?:Lint error > )?(.+?) \(([\w:.\-]+)\)$")
-_KTLINT_BRACKET = re.compile(r"^(/[^:\n]+):(\d+):(\d+):? Lint error > \[([\w:.\-]+)\] (.+)$")
+_KTLINT = re.compile(rf"^({_P}):(\d+):(\d+):? (?:Lint error > )?(.+?) \(([\w:.\-]+)\)$")
+_KTLINT_BRACKET = re.compile(rf"^({_P}):(\d+):(\d+):? Lint error > \[([\w:.\-]+)\] (.+)$")
 # ktlint Gradle plugin console output carries no rule id: "/abs/File.kt:6:19 Whitespace after ',' is missing"
-_KTLINT_PLAIN = re.compile(r"^(/[^:\n]+\.kts?):(\d+):(\d+):? (.+)$")
+_KTLINT_PLAIN = re.compile(rf"^({_P}\.kts?):(\d+):(\d+):? (.+)$")
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _FAILED_TASK = re.compile(r"^> Task (:\S+) FAILED")
 _OUTCOME = re.compile(r"^BUILD (SUCCESSFUL|FAILED) in .*$")
@@ -353,6 +364,7 @@ def parse_output(output: str, root: Path) -> Report:
     lines = _ANSI.sub("", output).splitlines()
 
     def add(d: Diagnostic) -> None:
+        d = replace(d, path=os.path.normpath(d.path))
         if d not in seen:
             seen.add(d)
             rep.diagnostics.append(d)
@@ -401,10 +413,10 @@ def format_report(
     root = run.project.root
     errors, warnings = rep.errors, rep.warnings
     hidden = 0
-    if only_files is not None:
-        hidden = sum(1 for d in errors if d.path not in only_files)
-        errors = [d for d in errors if d.path in only_files]
-        warnings = [d for d in warnings if d.path in only_files]
+    if only_files is not None:  # a set of path_key() values
+        hidden = sum(1 for d in errors if d.key not in only_files)
+        errors = [d for d in errors if d.key in only_files]
+        warnings = [d for d in warnings if d.key in only_files]
 
     if run.timed_out:
         head = f"TIMED OUT after {run.seconds:.0f}s (Gradle was killed)"

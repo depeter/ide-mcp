@@ -9,6 +9,13 @@
 # Safe to re-run: it replaces any existing registration of the same names.
 set -euo pipefail
 
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "On Windows use the PowerShell script instead:" >&2
+    echo "  powershell -ExecutionPolicy Bypass -File scripts\\install.ps1" >&2
+    exit 1 ;;
+esac
+
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DO_CODEX=1
 DO_CLAUDE=0
@@ -40,6 +47,10 @@ else
   echo "Need either uv or python3 (3.10+) on PATH." >&2
   exit 1
 fi
+
+for s in "${SERVERS[@]}"; do
+  [[ -x "$DIR/.venv/bin/$s-mcp" ]] || { echo "Build did not produce $DIR/.venv/bin/$s-mcp; not registering anything." >&2; exit 1; }
+done
 
 # Agents start MCP servers with a trimmed environment, so pin what Gradle needs instead of
 # relying on the shell profile at launch time.
@@ -79,7 +90,7 @@ if [[ $DO_CODEX -eq 1 ]]; then
     # Codex kills tool calls after 60s by default, which no real Gradle build survives.
     CONFIG="${CODEX_HOME:-$HOME/.codex}/config.toml"
     if [[ " ${SERVERS[*]} " == *" kotlin "* && -f "$CONFIG" ]]; then
-      python3 - "$CONFIG" "$KOTLIN_TIMEOUT" <<'PY'
+      "$DIR/.venv/bin/python" - "$CONFIG" "$KOTLIN_TIMEOUT" <<'PY'
 import re, sys
 path, timeout = sys.argv[1], sys.argv[2]
 text = open(path, encoding="utf-8").read()

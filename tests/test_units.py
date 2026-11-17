@@ -331,3 +331,30 @@ def test_word_regex():
     rx = symbols.word_regex("User")
     assert rx.search("val u: User?") and rx.search("List<User>")
     assert not rx.search("UserRepository") and not rx.search("myUser")
+
+
+WINDOWS_OUTPUT = """\
+e: file:///C:/work/app/src/main/java/A.kt:12:5 Unresolved reference 'foo'.
+C:\\work\\lib\\src\\main\\java\\C.java:40: error: cannot find symbol
+C:\\work\\app\\src\\main\\java\\D.kt:8:1: Line is too long [MaxLineLength]
+C:\\work\\app\\src\\main\\java\\F.kt:6:19 Whitespace after ',' is missing
+BUILD FAILED in 4s
+"""
+
+
+def test_parse_windows_paths():
+    rep = gradle.parse_output(WINDOWS_OUTPUT, Path("/unused"))
+    got = {d.path.replace("\\", "/"): (d.line, d.col, d.rule) for d in rep.diagnostics}
+    assert got == {
+        "C:/work/app/src/main/java/A.kt": (12, 5, ""),
+        "C:/work/lib/src/main/java/C.java": (40, 0, ""),
+        "C:/work/app/src/main/java/D.kt": (8, 1, "MaxLineLength"),
+        "C:/work/app/src/main/java/F.kt": (6, 19, "ktlint"),
+    }
+
+
+def test_cmd_line_quoting():
+    from ide_mcp.common import _cmd_line
+
+    line = _cmd_line(["C:\\my proj\\gradlew.bat", ":app:test", "--tests", "FooTest.does a thing", "-Pa=b&c"])
+    assert line == '"C:\\my proj\\gradlew.bat" :app:test --tests "FooTest.does a thing" "-Pa=b&c"'

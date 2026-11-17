@@ -7,10 +7,12 @@ import os
 import re
 import signal
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
+WINDOWS = sys.platform == "win32"
 MAX_OUTPUT = 30_000
 MAX_FILES = 200_000
 
@@ -85,6 +87,24 @@ def rel(path: Path, root: Path) -> str:
         return path.relative_to(root).as_posix()
     except ValueError:
         return path.as_posix()
+
+
+def path_key(path: str | os.PathLike[str]) -> str:
+    """Form of a path for equality checks: separators and (on Windows) case normalised, so a
+    path the compiler printed compares equal to the one the caller passed."""
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def android_sdk() -> str | None:
+    """Android SDK location from the environment or the usual install directories."""
+    for var in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        if os.environ.get(var):
+            return os.environ[var]
+    home = Path.home()
+    candidates = [home / "Android" / "Sdk", home / "android-sdk", home / "Library" / "Android" / "sdk"]
+    if os.environ.get("LOCALAPPDATA"):
+        candidates.insert(0, Path(os.environ["LOCALAPPDATA"]) / "Android" / "Sdk")
+    return next((str(c) for c in candidates if c.is_dir()), None)
 
 
 def is_binary(path: Path) -> bool:
@@ -226,17 +246,27 @@ async def run_proc(
     stdin is /dev/null (the server's own stdin is the MCP transport). The child gets its own
     process group so a timeout or a cancelled tool call takes its whole tree down with it.
     """
+    common = dict(
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        limit=4 * 1024 * 1024,
+    )
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(cwd) if cwd else None,
-            env=env,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-            limit=4 * 1024 * 1024,
-        )
+        if not WINDOWS:
+            proc = await asyncio.create_subprocess_exec(*argv, start_new_session=True, **common)
+        elif argv[0].lower().endswith((".bat", ".cmd")):
+            # Batch files (gradlew.bat) only run through cmd.exe. The shell variant wraps the whole
+            # line in one pair of quotes, which is the form cmd parses reliably.
+            proc = await asyncio.create_subprocess_shell(
+                _cmd_line(argv), creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, **common
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, **common
+            )
     except FileNotFoundError:
         raise ToolError(f"Executable not found: {argv[0]}") from None
     except OSError as e:
@@ -276,8 +306,37 @@ async def run_proc(
     return ProcResult(code=code, output="".join(chunks), timed_out=timed_out)
 
 
+def _cmd_line(argv: list[str]) -> str:
+    """Join arguments for cmd.exe, quoting those with spaces or shell metacharacters."""
+    parts = []
+    for a in argv:
+        if a and not re.search(r'[\s"&|<>^()%!]', a):
+            parts.append(a)
+        else:
+            parts.append('"' + a.replace('"', '\\"') + '"')
+    return " ".join(parts)
+
+
 async def _terminate(proc: asyncio.subprocess.Process) -> None:
-    """SIGTERM the process group, then SIGKILL if it hasn't gone within a few seconds."""
+    """Stop the process and everything it started. POSIX: SIGTERM the process group, then
+    SIGKILL if it hasn't gone within a few seconds. Windows: taskkill the process tree."""
+    if WINDOWS:
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/T", "/F", "/PID", str(proc.pid),
+                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+        except OSError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                return
+        try:
+            await asyncio.wait_for(proc.wait(), 10)
+        except asyncio.TimeoutError:
+            pass
+        return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):

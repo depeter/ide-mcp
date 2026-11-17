@@ -17,10 +17,23 @@ register only one if that is all you need.
 Requirements: [`uv`](https://docs.astral.sh/uv/) or Python 3.10+, `git`, and for the `kotlin`
 server a JDK (projects bring their own Gradle through `gradlew`).
 
+Linux and macOS:
+
 ```bash
 scripts/install.sh            # build .venv and register both servers with Codex
 scripts/install.sh --claude   # ...and also with Claude Code
 ```
+
+Windows (PowerShell; do not use `install.sh` from Git Bash):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1           # Codex
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Claude   # ...and Claude Code
+```
+
+On Windows the JDK is taken from `JAVA_HOME`, then `java` on `PATH`, then the one bundled with
+Android Studio. `run_command` runs PowerShell there instead of bash, and Gradle is started
+through `gradlew.bat`.
 
 The script pins `JAVA_HOME` and `ANDROID_HOME` for the `kotlin` server, because agents launch
 MCP servers with a trimmed environment, and raises Codex's tool timeout for it to 30 minutes
@@ -28,8 +41,8 @@ MCP servers with a trimmed environment, and raises Codex's tool timeout for it t
 
 | Script | Purpose |
 | --- | --- |
-| `scripts/check.sh` | Show what each server sees: tools, JDK, Android SDK, lint CLIs |
-| `scripts/uninstall.sh [--purge]` | Unregister from Codex/Claude; `--purge` also deletes `.venv` |
+| `scripts/check.sh`, `scripts\check.ps1` | Show what each server sees: tools, JDK, Android SDK, lint CLIs |
+| `scripts/uninstall.sh [--purge]`, `scripts\uninstall.ps1 [-Purge]` | Unregister from Codex/Claude; also delete `.venv` |
 
 ### Manual registration
 
@@ -39,7 +52,7 @@ MCP servers with a trimmed environment, and raises Codex's tool timeout for it t
 command = "/absolute/path/to/ide-mcp/.venv/bin/files-mcp"
 
 [mcp_servers.kotlin]
-command = "/absolute/path/to/ide-mcp/.venv/bin/kotlin-mcp"
+command = "/absolute/path/to/ide-mcp/.venv/bin/kotlin-mcp"   # Windows: '...\.venv\Scripts\kotlin-mcp.exe'
 tool_timeout_sec = 1800
 env = { JAVA_HOME = "/usr/lib/jvm/java-17-openjdk-amd64", ANDROID_HOME = "/home/you/Android/Sdk" }
 ```
@@ -129,7 +142,7 @@ Where this differs from the IDE:
 
 | Env var | Server | Effect |
 | --- | --- | --- |
-| `IDE_MCP_ALLOWED_ROOTS` | files | `:`-separated directories the file tools may touch. Unset means anywhere |
+| `IDE_MCP_ALLOWED_ROOTS` | files | Directories the file tools may touch, separated by `:` (`;` on Windows). Unset means anywhere |
 | `JAVA_HOME`, `ANDROID_HOME` | kotlin | Passed to Gradle. Pinned by `install.sh` |
 | `DETEKT_CLI`, `KTLINT_CLI` | kotlin | Explicit path to the fallback CLI binaries |
 

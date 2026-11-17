@@ -17,7 +17,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from . import gradle, symbols
-from .common import ToolError, clip, existing_dir, glob_matcher, iter_files, rel, resolve, run_proc
+from .common import ToolError, android_sdk, clip, existing_dir, glob_matcher, iter_files, path_key, rel, resolve, run_proc
 from .gradle import GradleProject, GradleRun, task_path
 
 mcp = FastMCP(
@@ -302,8 +302,8 @@ async def compile_sources(
     args = targets + (["--continue"] if len(targets) > 1 else [])
     run = await _run(ctx, project, args, timeout_sec)
     rep = gradle.parse_output(run.output, project.root)
-    only = {str(src)} if src and not module else None
-    if only and run.ok and not [d for d in rep.diagnostics if d.path in only]:
+    only = {path_key(src)} if src and not module else None
+    if only and run.ok and not [d for d in rep.diagnostics if d.key in only]:
         return f"No problems in {src} ({rep.outcome or 'BUILD SUCCESSFUL'}; ran {' '.join(targets)})."
     return format_run(run, rep, show_warnings=show_warnings, only_files=only, extra="\n".join(notes))
 
@@ -403,7 +403,7 @@ def _find_cli(env_var: str, *names: str) -> str | None:
 
 def _findings(title: str, run: GradleRun | None, diags: list[gradle.Diagnostic], root: Path, only: set[str] | None, limit: int = 150) -> str:
     if only is not None:
-        diags = [d for d in diags if d.path in only]
+        diags = [d for d in diags if d.key in only]
     by_rule: dict[str, int] = {}
     for d in diags:
         by_rule[d.rule or "?"] = by_rule.get(d.rule or "?", 0) + 1
@@ -471,7 +471,7 @@ async def detekt(
     project = _project(project_dir, files[0] if files else None)
     tasks = await _tasks(ctx, project)
     mods = _modules(project, tasks, module, paths)
-    only = {str(p) for p in paths} or None
+    only = {path_key(p) for p in paths} or None
 
     run = await _lint_via_gradle(ctx, project, tasks, mods, task, ["--auto-correct"] if auto_correct else [], timeout_sec)
     if run is not None:
@@ -520,7 +520,7 @@ async def ktlint(
     project = _project(project_dir, files[0] if files else None)
     tasks = await _tasks(ctx, project)
     mods = _modules(project, tasks, module, paths)
-    only = {str(p) for p in paths} or None
+    only = {path_key(p) for p in paths} or None
 
     for check_task, format_task in _KTLINT_TASKS:
         name = format_task if format else check_task
@@ -841,9 +841,7 @@ def check() -> int:
     print(f"cwd:     {Path.cwd()}")
     java = os.environ.get("JAVA_HOME") or shutil.which("java")
     print(f"java:    {java or 'NOT FOUND - Gradle needs JAVA_HOME or java on PATH'}")
-    sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
-    if not sdk and (Path.home() / "Android" / "Sdk").is_dir():
-        sdk = str(Path.home() / "Android" / "Sdk")
+    sdk = android_sdk()
     print(f"android: {sdk or 'no SDK found (fine for JVM projects, or when local.properties sets sdk.dir)'}")
     print(f"detekt:  {_find_cli('DETEKT_CLI', 'detekt', 'detekt-cli') or 'no CLI (Gradle detekt tasks are used when present)'}")
     print(f"ktlint:  {_find_cli('KTLINT_CLI', 'ktlint') or 'no CLI (Gradle ktlint/spotless tasks are used when present)'}")
