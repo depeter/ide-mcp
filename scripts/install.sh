@@ -5,6 +5,8 @@
 #   scripts/install.sh --claude      also register with Claude Code (user scope)
 #   scripts/install.sh --no-codex    build only (combine with --claude if wanted)
 #   scripts/install.sh --only kotlin register just one of the two servers (files | kotlin)
+#   scripts/install.sh --with-lsp    also download JetBrains' Kotlin language server (370 MB) for
+#                                    code-aware find usages, rename and IntelliJ inspections
 #
 # Safe to re-run: it replaces any existing registration of the same names.
 set -euo pipefail
@@ -20,16 +22,18 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DO_CODEX=1
 DO_CLAUDE=0
 SERVERS=(files kotlin)
+WITH_LSP=0
 KOTLIN_TIMEOUT=1800
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --claude) DO_CLAUDE=1; shift ;;
     --no-codex) DO_CODEX=0; shift ;;
+    --with-lsp) WITH_LSP=1; shift ;;
     --only)
       case "${2:-}" in files|kotlin) SERVERS=("$2") ;; *) echo "--only needs 'files' or 'kotlin'" >&2; exit 2 ;; esac
       shift 2 ;;
-    -h|--help) sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -68,6 +72,11 @@ KOTLIN_ENV=()
 [[ -n "$JAVA" && -x "$JAVA/bin/java" ]] && KOTLIN_ENV+=(--env "JAVA_HOME=$JAVA")
 [[ -n "$SDK" ]] && KOTLIN_ENV+=(--env "ANDROID_HOME=$SDK")
 [[ ${#KOTLIN_ENV[@]} -eq 0 ]] && echo "!!  No JDK found; Gradle tools will fail until JAVA_HOME is set (JAVA_HOME=/path $0)." >&2
+
+if [[ $WITH_LSP -eq 1 ]]; then
+  echo "==> Installing the Kotlin language server"
+  "$DIR/.venv/bin/kotlin-mcp" --install-lsp
+fi
 
 echo "==> Self-check"
 for s in "${SERVERS[@]}"; do

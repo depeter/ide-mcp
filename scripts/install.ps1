@@ -4,6 +4,8 @@
 #   scripts\install.ps1 -Claude        also register with Claude Code (user scope)
 #   scripts\install.ps1 -NoCodex       build only (combine with -Claude if wanted)
 #   scripts\install.ps1 -Only kotlin   register just one of the two servers (files | kotlin)
+#   scripts\install.ps1 -WithLsp       also download JetBrains' Kotlin language server (370 MB) for
+#                                      code-aware find usages, rename and IntelliJ inspections
 #
 # If script execution is blocked, run it as:
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1
@@ -13,6 +15,7 @@
 param(
     [switch]$Claude,
     [switch]$NoCodex,
+    [switch]$WithLsp,
     [ValidateSet('files', 'kotlin')][string]$Only
 )
 
@@ -102,6 +105,12 @@ $KotlinEnv = @()
 if ($Java) { $KotlinEnv += @('--env', "JAVA_HOME=$Java") }
 else { Write-Warning 'No JDK found; Gradle tools will fail until JAVA_HOME is set. Set it and re-run.' }
 if ($Sdk) { $KotlinEnv += @('--env', "ANDROID_HOME=$Sdk") }
+
+if ($WithLsp) {
+    Write-Host '==> Installing the Kotlin language server'
+    & (Join-Path $Bin 'kotlin-mcp.exe') --install-lsp
+    if ($LASTEXITCODE -ne 0) { Write-Warning 'Language server install failed; the text-based tools still work.' }
+}
 
 Write-Host '==> Self-check'
 $savedJava = $env:JAVA_HOME; $savedSdk = $env:ANDROID_HOME

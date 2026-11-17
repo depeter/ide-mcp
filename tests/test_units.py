@@ -358,3 +358,69 @@ def test_cmd_line_quoting():
 
     line = _cmd_line(["C:\\my proj\\gradlew.bat", ":app:test", "--tests", "FooTest.does a thing", "-Pa=b&c"])
     assert line == '"C:\\my proj\\gradlew.bat" :app:test --tests "FooTest.does a thing" "-Pa=b&c"'
+
+
+# ----------------------------------------------------------------------------- language server edits
+
+
+def _rng(l1, c1, l2, c2):
+    return {"start": {"line": l1, "character": c1}, "end": {"line": l2, "character": c2}}
+
+
+def test_apply_text_edits_micro_edits_and_crlf():
+    from ide_mcp import lsp
+
+    text = "val a: DoorEvent\r\nfun f(e: DoorEvent) = e\r\n"
+    # The server renames with several small edits per occurrence: "Event" -> "Sig" + "n" + "al".
+    edits = [
+        {"range": _rng(0, 11, 0, 14), "newText": "Sig"},
+        {"range": _rng(0, 15, 0, 16), "newText": "al"},
+        {"range": _rng(1, 13, 1, 16), "newText": "Sig"},
+        {"range": _rng(1, 17, 1, 18), "newText": "al"},
+    ]
+    assert lsp.apply_text_edits(text, edits) == "val a: DoorSignal\r\nfun f(e: DoorSignal) = e\r\n"
+
+
+def test_utf16_columns():
+    from ide_mcp import lsp
+
+    line = 'val s = "\U0001F600" + name'  # the emoji is two UTF-16 units
+    idx = line.index("name")
+    col = lsp.utf16_col(line, idx)
+    assert col == idx + 1
+    assert lsp.py_index(line, col) == idx
+
+
+def test_plan_and_write_workspace_edit(tmp_path: Path):
+    from ide_mcp import lsp
+
+    a = tmp_path / "Old.kt"
+    b = tmp_path / "Use.kt"
+    a.write_text("class Old\n")
+    b.write_text("val x = Old()\nval y = 1\n")
+    edit = {
+        "documentChanges": [
+            {"textDocument": {"uri": a.as_uri(), "version": 0}, "edits": [{"range": _rng(0, 6, 0, 9), "newText": "New"}]},
+            {"textDocument": {"uri": b.as_uri(), "version": 0}, "edits": [{"range": _rng(0, 8, 0, 11), "newText": "New"}]},
+            {"kind": "rename", "oldUri": a.as_uri(), "newUri": (tmp_path / "New.kt").as_uri()},
+        ]
+    }
+    changes = lsp.plan_workspace_edit(edit)
+    assert a.read_text() == "class Old\n"  # planning does not write
+    by_name = {c.path.name: c for c in changes}
+    assert by_name["Use.kt"].changed_lines() == [(1, "val x = New()")]
+    assert by_name["Old.kt"].new_path == tmp_path / "New.kt"
+    lsp.write_changes(changes)
+    assert not a.exists()
+    assert (tmp_path / "New.kt").read_text() == "class New\n"
+    assert b.read_text() == "val x = New()\nval y = 1\n"
+
+
+def test_session_reports_partial_import(tmp_path: Path):
+    from ide_mcp import lsp
+
+    s = lsp.Session(root=tmp_path, proc=None)  # type: ignore[arg-type]
+    assert s.unreliable() == ""
+    s._handle({"method": "intellij/importLog", "params": {"message": "Querying the mapped value of x before task ':app:generateDebugAndroidTestBuildConfig' has completed is not supported"}})
+    s._handle({"method": "intellij/workspaceImportState", "params": {"phase": "FINISHED", "folders": [{"status": "SUCCESS"}]}})
+    assert ":app" in s.unreliable() and "issues/253" in s.unreliable()
