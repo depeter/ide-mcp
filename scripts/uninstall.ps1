@@ -27,6 +27,12 @@ foreach ($s in @('files', 'kotlin')) {
 if ($Purge) {
     $venv = Join-Path $Dir '.venv'
     if (Test-Path $venv) {
+        # A server still running out of the virtualenv keeps its files locked on Windows.
+        $prefix = $venv + '\'
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessId -ne $PID -and $_.ExecutablePath -and
+            $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+        } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         Remove-Item -Recurse -Force $venv
         Write-Host "Deleted $venv"
     }

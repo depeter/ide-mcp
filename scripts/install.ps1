@@ -47,7 +47,24 @@ function Test-Python([string]$Exe, [string[]]$Prefix) {
     return ($LASTEXITCODE -eq 0)
 }
 
+# Windows locks a running .exe, so a server still held open by an agent session makes the rebuild
+# fail with "being used by another process". Stop anything running out of this virtualenv first.
+function Stop-VenvProcesses {
+    $venv = (Join-Path $Dir '.venv') + '\'
+    $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessId -ne $PID -and (
+                ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($venv, [StringComparison]::OrdinalIgnoreCase)) -or
+                ($_.CommandLine -and $_.CommandLine.IndexOf($venv, [StringComparison]::OrdinalIgnoreCase) -ge 0))
+        })
+    foreach ($p in $procs) {
+        Write-Host "    stopping running $($p.Name) (pid $($p.ProcessId))"
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    if ($procs.Count -gt 0) { Start-Sleep -Milliseconds 500 }
+}
+
 Write-Host "==> Building virtualenv in $Dir\.venv"
+Stop-VenvProcesses
 $uv = Find-App 'uv'
 if ($uv) {
     Push-Location $Dir
