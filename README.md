@@ -345,7 +345,8 @@ headless. With it they resolve symbols the way the IDE does: renaming the `scope
 one class leaves every other `scope` alone, and `file_problems` reports inspections such as
 unused code or deprecated API, not only compiler errors.
 
-It is optional and not bundled. Install it once:
+It is not bundled. The install script downloads it on first run and reuses it afterwards; pass
+`--no-lsp` / `-NoLsp` to skip it. To install it on its own:
 
 ```bash
 .venv/bin/kotlin-mcp --install-lsp          # Linux
@@ -353,7 +354,7 @@ It is optional and not bundled. Install it once:
 brew install JetBrains/utils/kotlin-lsp     # macOS
 ```
 
-or pass `--with-lsp` / `-WithLsp` to the install script. The download is about 370 MB (1.2 GB
+The download is about 370 MB (1.2 GB
 unpacked, under `~/.local/share/ide-mcp` or `%LOCALAPPDATA%\ide-mcp`) and is verified against
 JetBrains' published SHA-256. It is JetBrains software under JetBrains' terms, currently Alpha.
 

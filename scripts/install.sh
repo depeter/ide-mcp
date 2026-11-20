@@ -5,8 +5,8 @@
 #   scripts/install.sh --claude      also register with Claude Code (user scope)
 #   scripts/install.sh --no-codex    build only (combine with --claude if wanted)
 #   scripts/install.sh --only kotlin register just one of the two servers (files | kotlin)
-#   scripts/install.sh --with-lsp    also download JetBrains' Kotlin language server (370 MB) for
-#                                    code-aware find usages, rename and IntelliJ inspections
+#   scripts/install.sh --no-lsp      skip JetBrains' Kotlin language server (downloaded once by
+#                                    default, 370 MB, for the code-aware tools; later runs reuse it)
 #
 # Safe to re-run: it replaces any existing registration of the same names.
 set -euo pipefail
@@ -22,14 +22,15 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DO_CODEX=1
 DO_CLAUDE=0
 SERVERS=(files kotlin)
-WITH_LSP=0
+WITH_LSP=1
 KOTLIN_TIMEOUT=1800
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --claude) DO_CLAUDE=1; shift ;;
     --no-codex) DO_CODEX=0; shift ;;
-    --with-lsp) WITH_LSP=1; shift ;;
+    --no-lsp) WITH_LSP=0; shift ;;
+    --with-lsp) shift ;;  # accepted for older command lines; now the default
     --only)
       case "${2:-}" in files|kotlin) SERVERS=("$2") ;; *) echo "--only needs 'files' or 'kotlin'" >&2; exit 2 ;; esac
       shift 2 ;;
@@ -73,9 +74,10 @@ KOTLIN_ENV=()
 [[ -n "$SDK" ]] && KOTLIN_ENV+=(--env "ANDROID_HOME=$SDK")
 [[ ${#KOTLIN_ENV[@]} -eq 0 ]] && echo "!!  No JDK found; Gradle tools will fail until JAVA_HOME is set (JAVA_HOME=/path $0)." >&2
 
-if [[ $WITH_LSP -eq 1 ]]; then
-  echo "==> Installing the Kotlin language server"
-  "$DIR/.venv/bin/kotlin-mcp" --install-lsp
+if [[ $WITH_LSP -eq 1 && " ${SERVERS[*]} " == *" kotlin "* ]]; then
+  echo "==> Installing the Kotlin language server (skip with --no-lsp)"
+  "$DIR/.venv/bin/kotlin-mcp" --install-lsp ||
+    echo "!!  Language server install failed; the code-aware tools stay blocked until it is installed. Retry with: .venv/bin/kotlin-mcp --install-lsp" >&2
 fi
 
 echo "==> Self-check"
