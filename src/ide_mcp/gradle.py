@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from .common import SKIP_DIRS, WINDOWS, ToolError, android_sdk, clip, path_key, rel, resolve, run_proc
+from .common import SKIP_DIRS, WINDOWS, Blocked, ToolError, active, android_sdk, clip, is_link, path_key, rel, resolve, run_proc
 
 SETTINGS = ("settings.gradle.kts", "settings.gradle")
 BUILD_FILES = ("build.gradle.kts", "build.gradle")
@@ -34,7 +34,6 @@ class GradleProject:
     launcher: tuple[str, ...]
 
 
-
 def _has_wrapper(root: Path) -> bool:
     return (root / ("gradlew.bat" if WINDOWS else "gradlew")).is_file()
 
@@ -53,13 +52,17 @@ def _launcher(root: Path) -> tuple[str, ...] | None:
     return (system,) if system else None
 
 
-def find_project(path: str | None) -> GradleProject:
+def find_project(path: str | None, *, search_below: bool = True) -> GradleProject:
     """Find the Gradle build that owns `path` (a file or directory anywhere inside it).
 
     Walks up to the nearest settings file that has a wrapper next to it, so a path inside an
     included build without its own wrapper lands on the outer build. If nothing is found above,
     looks a few levels below, which covers Flutter/React Native layouts where the Gradle build
-    lives in <repo>/android or <repo>/app/android.
+    lives in <repo>/android or <repo>/app/android. `search_below=False` skips that walk, for
+    callers that must not scan directories.
+
+    This only locates a build from file names. Callers verify the result against the request
+    scope (kotlin_server._project) before using it.
     """
     start = resolve(path)
     if not start.exists():
@@ -78,9 +81,11 @@ def find_project(path: str | None) -> GradleProject:
         raise ToolError(f"Found a Gradle build at {d} but it has no gradlew wrapper and `gradle` is not on PATH.")
 
     below: list[Path] = []
-    for dirpath, dirnames, _files in os.walk(start):
+    for dirpath, dirnames, _files in os.walk(start) if search_below else ():
         depth = len(Path(dirpath).relative_to(start).parts)
-        dirnames[:] = [] if depth >= 3 else [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        dirnames[:] = [] if depth >= 3 else [
+            d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".") and not is_link(Path(dirpath) / d)
+        ]
         if depth and _has(Path(dirpath), SETTINGS):
             below.append(Path(dirpath))
             dirnames[:] = []
@@ -111,6 +116,7 @@ def module_dirs(root: Path) -> dict[str, Path]:
         dirnames[:] = sorted(
             n for n in dirnames
             if n not in SKIP_DIRS and not n.startswith(".") and n != "buildSrc" and not _has(d / n, SETTINGS)
+            and not is_link(d / n)
         )
         if d != root and _has(d, BUILD_FILES):
             out[":" + ":".join(d.relative_to(root).parts)] = d
@@ -162,6 +168,78 @@ class GradleRun:
 
 
 _locks: dict[Path, asyncio.Lock] = {}
+_launched: set[str] = set()  # path_key of every project root this server process has started Gradle in
+
+# Options whose value points Gradle at a different project, settings or build script.
+_REDIRECT_LONG = ("--project-dir", "--settings-file", "--build-file", "--include-build", "--init-script")
+_REDIRECT_SHORT = ("-p", "-c", "-b", "-I")
+
+
+def redirect_values(args: list[str]) -> list[tuple[str, str | None]]:
+    """(option, path) for every argument that selects another project directory, settings
+    file, build file, included build or init script, in all the forms Gradle accepts. The path
+    is None when the option is the last argument and its value is missing."""
+    found: list[tuple[str, str | None]] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        following = args[i + 1] if i + 1 < len(args) else None
+        if a in _REDIRECT_LONG or a in _REDIRECT_SHORT:
+            found.append((a, following))
+            i += 1
+        elif a.startswith("--"):
+            name, eq, value = a.partition("=")
+            if eq and name in _REDIRECT_LONG:
+                found.append((name, value))
+        elif a[:2] in _REDIRECT_SHORT and len(a) > 2:
+            found.append((a[:2], a[2:].lstrip("=")))
+        i += 1
+    return found
+
+
+def check_arguments(project: GradleProject, args: list[str]) -> None:
+    """Reject arguments that would make Gradle build something other than the verified project.
+    A redirect to a location inside the request scope, such as `-p app`, is allowed."""
+    scope = active()
+    for option, value in redirect_values(args):
+        if not value:
+            raise Blocked("argument_redirect", f"Gradle option {option} is missing its path. Nothing was run.", "input")
+        target = Path(os.path.expanduser(value))
+        try:
+            scope.check(target if target.is_absolute() else project.root / target, protected=False)
+        except Blocked as e:
+            if e.reason != "target_mismatch":
+                raise
+            raise Blocked(
+                "argument_redirect",
+                f"Gradle option {option} {value} would redirect the build away from {project.root}: {e.detail}",
+            ) from None
+
+
+def java() -> str | None:
+    home = os.environ.get("JAVA_HOME")
+    if home:
+        return home if Path(home).is_dir() else None
+    return shutil.which("java")
+
+
+def execution_state(project: GradleProject) -> tuple[str, str | None, str | None]:
+    """Whether Gradle can be started for this project, from what is already known: no process
+    is run. `available` needs evidence, which an installed wrapper and JDK are not, so it is
+    only reported once this server has actually started Gradle here."""
+    launcher = Path(project.launcher[-1] if project.launcher[0] == "sh" else project.launcher[0])
+    if not launcher.is_file():
+        return "unavailable", "execution_unavailable", f"The Gradle launcher {launcher} is missing."
+    if java() is None:
+        return "unavailable", "execution_unavailable", "No JDK found: set JAVA_HOME for this server or put java on PATH."
+    if path_key(project.root) in _launched:
+        return "available", None, None
+    return (
+        "unknown",
+        "execution_not_observed",
+        "A Gradle launcher and a JDK are present, but this server has not run Gradle for this project yet; "
+        "only running it shows whether it works.",
+    )
 
 
 def _gradle_env() -> dict[str, str]:
@@ -194,7 +272,18 @@ async def run_gradle(
     save_log: bool = True,
 ) -> GradleRun:
     """Run Gradle in the project root. Invocations for the same build are serialised, since a
-    second client would only sit waiting for the first one's lock anyway."""
+    second client would only sit waiting for the first one's lock anyway.
+
+    The project, its launcher and the arguments are verified here, immediately before the
+    launch, whatever an earlier readiness query or project lookup found."""
+    scope = active("execution")
+    project = replace(project, root=scope.check_project(project.root))
+    if within_project := [a for a in project.launcher if Path(a).name.startswith("gradlew")]:
+        scope.check(within_project[0], protected=False)
+    check_arguments(project, args)
+    state, reason, detail = execution_state(project)
+    if state == "unavailable":
+        raise Blocked(reason or "execution_unavailable", f"Gradle cannot be started for {project.root}: {detail}", "environment")
     lock = _locks.setdefault(project.root, asyncio.Lock())
     async with lock:
         started = time.time()
@@ -205,6 +294,7 @@ async def run_gradle(
             env=_gradle_env(),
             on_line=on_line,
         )
+        _launched.add(path_key(project.root))  # it started, whatever the build's result
         seconds = time.time() - started
     log = _save_log(project, args, r.output) if save_log else None
     return GradleRun(project, args, r.code, r.output, seconds, log, r.timed_out, started)
@@ -247,7 +337,9 @@ async def project_tasks(
         return _tasks_cache[project.root]
     run = await run_gradle(project, ["tasks", "--all", "-q"], timeout=600, on_line=on_line, save_log=False)
     if not run.ok:
-        raise ToolError("Could not list Gradle tasks; the build does not configure.\n" + format_report(run, parse_output(run.output, project.root)))
+        e = ToolError("Could not list Gradle tasks; the build does not configure.\n" + format_report(run, parse_output(run.output, project.root)))
+        e.category = "unknown"  # a broken build script or a broken environment; the report says which
+        raise e
     tasks = parse_tasks(run.output)
     if not tasks:
         raise ToolError("Gradle reported no tasks.\n" + clip(run.output, 4000, keep="tail"))
@@ -495,6 +587,7 @@ def _trim_stack(text: str, keep: int = 10) -> str:
 def collect_tests(dirs: list[Path], since: float) -> TestSummary:
     """Summarise the JUnit XML reports under the given result directories that were written
     since `since` (0 for all)."""
+    scope = active()
     summary = TestSummary()
     for results in dirs:
         if not results.is_dir():
@@ -503,8 +596,8 @@ def collect_tests(dirs: list[Path], since: float) -> TestSummary:
             try:
                 if xml.stat().st_mtime < since - 1:
                     continue
-                suite = ET.parse(xml).getroot()
-            except (OSError, ET.ParseError):
+                suite = ET.fromstring(scope.read_bytes(xml))
+            except (OSError, ET.ParseError, ToolError):
                 continue
             summary.suites += 1
             summary.total += int(suite.get("tests", 0))

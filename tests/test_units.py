@@ -8,12 +8,17 @@ from pathlib import Path
 import pytest
 
 from ide_mcp import files_server as fs
-from ide_mcp import gradle, symbols
+from ide_mcp import gradle, guard, symbols
 from ide_mcp.common import ToolError, glob_matcher, iter_files
 
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def scoped(root: Path):
+    """Run shared helpers the way a registered operation does, confined to `root`."""
+    return guard.activate(guard.Scope.of(str(root)))
 
 
 # ----------------------------------------------------------------------------- common
@@ -43,9 +48,10 @@ def test_iter_files_skips_build_dirs(tmp_path: Path):
     (tmp_path / "src" / "A.kt").write_text("class A")
     (tmp_path / "build").mkdir()
     (tmp_path / "build" / "junk.kt").write_text("x")
-    names = {f.name for f in iter_files(tmp_path)}
-    assert names == {"A.kt"}
-    assert {f.name for f in iter_files(tmp_path, include_ignored=True)} == {"A.kt", "junk.kt"}
+    with scoped(tmp_path):
+        names = {f.name for f in iter_files(tmp_path)}
+        assert names == {"A.kt"}
+        assert {f.name for f in iter_files(tmp_path, include_ignored=True)} == {"A.kt", "junk.kt"}
 
 
 # ----------------------------------------------------------------------------- files server
@@ -55,37 +61,39 @@ def test_replace_text_unique_and_ambiguous(tmp_path: Path):
     f = tmp_path / "a.txt"
     f.write_text("one\ntwo\none\n")
     with pytest.raises(ToolError, match="matches 2 places"):
-        run(fs.replace_text(str(f), "one", "1"))
-    run(fs.replace_text(str(f), "two", "2"))
+        run(fs.replace_text(str(f), "one", "1", expected_root=str(tmp_path)))
+    run(fs.replace_text(str(f), "two", "2", expected_root=str(tmp_path)))
     assert f.read_text() == "one\n2\none\n"
-    run(fs.replace_text(str(f), "one", "1", replace_all=True))
+    run(fs.replace_text(str(f), "one", "1", replace_all=True, expected_root=str(tmp_path)))
     assert f.read_text() == "1\n2\n1\n"
     with pytest.raises(ToolError, match="not found"):
-        run(fs.replace_text(str(f), "missing", "x"))
+        run(fs.replace_text(str(f), "missing", "x", expected_root=str(tmp_path)))
 
 
 def test_replace_text_keeps_crlf_and_backslashes(tmp_path: Path):
     f = tmp_path / "a.txt"
     f.write_bytes(b"a\r\nb\r\nc\r\n")
-    run(fs.replace_text(str(f), "a\nb", r"x\1\ny"))
+    run(fs.replace_text(str(f), "a\nb", r"x\1\ny", expected_root=str(tmp_path)))
     assert f.read_bytes() == b"x\\1\\ny\r\nc\r\n"  # literal mode: backslashes are not escapes
     f.write_text("val x = 1\n")
-    run(fs.replace_text(str(f), r"val (\w+)", r"var \1", regex=True))
+    run(fs.replace_text(str(f), r"val (\w+)", r"var \1", regex=True, expected_root=str(tmp_path)))
     assert f.read_text() == "var x = 1\n"
 
 
 def test_create_read_move_delete(tmp_path: Path):
     f = tmp_path / "deep" / "dir" / "a.txt"
-    run(fs.create_file(str(f), "l1\nl2\nl3\n"))
+    run(fs.create_file(str(f), "l1\nl2\nl3\n", expected_root=str(tmp_path)))
     with pytest.raises(ToolError, match="already exists"):
-        run(fs.create_file(str(f), "x"))
-    out = run(fs.read_file(str(f), start_line=2, max_lines=1))
+        run(fs.create_file(str(f), "x", expected_root=str(tmp_path)))
+    out = run(fs.read_file(str(f), start_line=2, max_lines=1, expected_root=str(tmp_path)))
     assert "lines 2-2 of 3" in out and "2\tl2" in out and "start_line=3" in out
-    run(fs.move_path(str(f), str(tmp_path / "b.txt")))
+    run(fs.move_path(str(f), str(tmp_path / "b.txt"), expected_root=str(tmp_path)))
     assert (tmp_path / "b.txt").exists() and not f.exists()
     with pytest.raises(ToolError, match="non-empty"):
-        run(fs.delete_path(str(tmp_path)))
-    run(fs.delete_path(str(tmp_path / "b.txt")))
+        run(fs.delete_path(str(tmp_path / "deep"), expected_root=str(tmp_path)))
+    with pytest.raises(ToolError, match="expected_root of this request"):
+        run(fs.delete_path(str(tmp_path), expected_root=str(tmp_path)))
+    run(fs.delete_path(str(tmp_path / "b.txt"), expected_root=str(tmp_path)))
     assert not (tmp_path / "b.txt").exists()
 
 
@@ -93,13 +101,13 @@ def test_search_and_find(tmp_path: Path):
     (tmp_path / "a").mkdir()
     (tmp_path / "a" / "Foo.kt").write_text("class Foo\nfun bar() = Foo()\n")
     (tmp_path / "a" / "note.md").write_text("Foo is great\n")
-    out = run(fs.search_in_files("Foo", str(tmp_path), file_glob="*.kt"))
+    out = run(fs.search_in_files("Foo", str(tmp_path), file_glob="*.kt", expected_root=str(tmp_path)))
     assert "2 matching line(s)" in out and "a/Foo.kt" in out and "note.md" not in out
-    out = run(fs.search_in_files(r"fun \w+\(", str(tmp_path), regex=True))
+    out = run(fs.search_in_files(r"fun \w+\(", str(tmp_path), regex=True, expected_root=str(tmp_path)))
     assert "2: fun bar() = Foo()" in out
-    out = run(fs.find_files(str(tmp_path), name_contains="foo"))
+    out = run(fs.find_files(str(tmp_path), name_contains="foo", expected_root=str(tmp_path)))
     assert "a/Foo.kt" in out
-    out = run(fs.list_directory_tree(str(tmp_path)))
+    out = run(fs.list_directory_tree(str(tmp_path), expected_root=str(tmp_path)))
     assert "a/" in out and "  Foo.kt" in out
 
 
@@ -211,7 +219,8 @@ def test_collect_tests(tmp_path: Path):
         "java.lang.AssertionError: expected 1 but was 2\n\tat org.junit.Assert.fail(Assert.java:89)\n"
         "\tat com.x.FooTest.bad(FooTest.kt:12)\n</failure></testcase></testsuite>"
     )
-    s = gradle.collect_tests([d], 0.0)
+    with scoped(tmp_path):
+        s = gradle.collect_tests([d], 0.0)
     assert (s.total, s.failed, s.skipped, s.suites) == (3, 1, 1, 1)
     text = s.render()
     assert "FAILED com.x.FooTest.bad: expected 1 but was 2" in text
@@ -405,12 +414,13 @@ def test_plan_and_write_workspace_edit(tmp_path: Path):
             {"kind": "rename", "oldUri": a.as_uri(), "newUri": (tmp_path / "New.kt").as_uri()},
         ]
     }
-    changes = lsp.plan_workspace_edit(edit)
-    assert a.read_text() == "class Old\n"  # planning does not write
-    by_name = {c.path.name: c for c in changes}
-    assert by_name["Use.kt"].changed_lines() == [(1, "val x = New()")]
-    assert by_name["Old.kt"].new_path == tmp_path / "New.kt"
-    lsp.write_changes(changes)
+    with scoped(tmp_path):
+        changes = lsp.plan_workspace_edit(edit)
+        assert a.read_text() == "class Old\n"  # planning does not write
+        by_name = {c.path.name: c for c in changes}
+        assert by_name["Use.kt"].changed_lines() == [(1, "val x = New()")]
+        assert by_name["Old.kt"].new_path == tmp_path / "New.kt"
+        lsp.write_changes(changes)
     assert not a.exists()
     assert (tmp_path / "New.kt").read_text() == "class New\n"
     assert b.read_text() == "val x = New()\nval y = 1\n"

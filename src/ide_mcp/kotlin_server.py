@@ -16,17 +16,46 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import gradle, lsp, symbols
-from .common import ToolError, android_sdk, clip, existing_dir, glob_matcher, iter_files, path_key, rel, resolve, run_proc
+from . import gradle, guard, lsp, symbols
+from .common import (
+    Blocked,
+    OutcomeError,
+    ToolError,
+    active,
+    android_sdk,
+    clip,
+    glob_matcher,
+    identity,
+    iter_files,
+    path_key,
+    protected_name,
+    real,
+    rel,
+    run_proc,
+    within,
+)
 from .gradle import GradleProject, GradleRun, task_path
+from .guard import EXECUTION, PROJECT, SEMANTIC, TARGET, ExpectedRoot, Readiness
 
 mcp = FastMCP(
     "kotlin",
     instructions=(
         "Gradle, detekt, ktlint and Kotlin/Java symbol tools that work on any project on disk; "
         "nothing has to be open in Android Studio or IntelliJ.\n"
-        "Every Gradle tool takes `project_dir`: any absolute path inside the project (a file works "
-        "too). The Gradle root is found from there, including <repo>/android layouts. Modules are "
+        "Every tool requires `expected_root`: the absolute path of the Git worktree the request is "
+        "for (or a directory inside it at or above the Gradle root), or, outside Git, the project "
+        "root itself. The project a tool actually resolves, every file it is given and the language "
+        "server session it uses must belong to that worktree, or the call is rejected before "
+        "anything is read, written or run; a folder that merely contains several checkouts does not "
+        "select one. It restricts the request and grants nothing. *.properties files are never "
+        "read.\n"
+        "Rejections and failures are tool errors that start with [outcome=... reason=... "
+        "category=...]; builds, tests and lint runs state passed, failed, timed_out or not_run. "
+        "`readiness` reports, without running Gradle or starting the language server, whether "
+        "execution and code-aware analysis are available for a scope; each tool checks again when "
+        "it runs.\n"
+        "Gradle tools take `project_dir`: any path inside the project (a file works too), "
+        "defaulting to expected_root. The Gradle root is found from there, including <repo>/android layouts. Modules are "
         "Gradle paths like ':app' or ':features:login'; passing `file` instead picks the module "
         "that owns that file.\n"
         "After editing code, call `compile` with the file you changed: it compiles just that module "
@@ -38,11 +67,21 @@ mcp = FastMCP(
         "reports IntelliJ inspections without a build. The first call per project imports and "
         "indexes it, which takes from seconds to minutes; later calls are fast. When a name is "
         "declared more than once, pass `file` and `line` of one place it appears. If the language "
-        "server is missing or cannot import the project, find_usages and rename_symbol say so and "
-        "fall back to whole-word text matching. find_symbol and file_outline always read source "
-        "text. Run compile after a rename."
+        "server is missing, still indexing, or cannot import the project, the code-aware tools are "
+        "blocked and say why. Only find_usages can answer with whole-word text matches instead "
+        "(engine='auto', the default, or engine='text'), and it labels them as unresolved text "
+        "matches. Every navigation and rename result starts with [engine=... requested=... "
+        "project=... complete=...]: the engine actually used, the project actually used, and whether "
+        "the listing is the whole answer.\n"
+        "rename_symbol is always semantic and works in two calls: a preview that writes nothing and "
+        "returns a preview_id, then dry_run=false with that preview_id, which is rejected as stale "
+        "if anything changed in between. find_implementations, find_callers and find_callees are "
+        "separate, direct, bounded queries; they describe static relationships, not a runtime "
+        "order, and do not follow chains. find_symbol and file_outline read source text and resolve "
+        "nothing. Run compile after a rename."
     ),
 )
+ops = guard.Operations(mcp)
 
 READ = ToolAnnotations(readOnlyHint=True)
 ACT = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
@@ -50,7 +89,7 @@ DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 
 ProjectDir = Annotated[
     str | None,
-    Field(description="Absolute path anywhere inside the Gradle project (directory or file). Defaults to the server's start directory."),
+    Field(description="Absolute path anywhere inside the Gradle project (directory or file), inside expected_root. Defaults to expected_root."),
 ]
 Module = Annotated[
     str | None,
@@ -67,7 +106,7 @@ Variant = Annotated[
 Timeout = Annotated[int, Field(description="Kill Gradle after this many seconds.", ge=10, le=7200)]
 SearchRoot = Annotated[
     str | None,
-    Field(description="Absolute directory to search (a project root or any subdirectory). Defaults to the server's start directory."),
+    Field(description="Absolute directory to search (a project root or any subdirectory), inside expected_root. Defaults to expected_root."),
 ]
 
 
@@ -117,17 +156,46 @@ async def _tasks(ctx: Context | None, project: GradleProject, refresh: bool = Fa
         return await gradle.project_tasks(project, refresh=refresh, on_line=p.on_line)
 
 
-def _project(project_dir: str | None, file: str | None = None) -> GradleProject:
-    return gradle.find_project(project_dir if project_dir else file)
+def _project(project_dir: str | None, file: str | None = None, *, search_below: bool = True) -> GradleProject:
+    """The Gradle build a request targets, verified against its scope.
+
+    The path the caller gave is checked first, so a target in another worktree is rejected
+    before any directory is looked at. The build that discovery then returns is checked again,
+    because that, not the path supplied, is what Gradle would run in."""
+    scope = active()
+    start = scope.check(project_dir or file or scope.root, protected=False)
+    found = gradle.find_project(str(start), search_below=search_below)
+    actual = real(found.root)
+    if actual != scope.root and within(scope.root, actual):
+        raise Blocked(
+            "invalid_scope",
+            f"expected_root {scope.root} is inside the Gradle project {actual}, so it cannot confine a build of that "
+            f"project. Pass the worktree or {actual} as expected_root.",
+            "input",
+        )
+    return GradleProject(scope.check_project(actual), found.launcher)
 
 
 def _source(file: str | None) -> Path | None:
     if not file:
         return None
-    p = resolve(file)
+    p = active().check(file)
     if not p.is_file():
         raise ToolError(f"File does not exist: {p}")
     return p
+
+
+def _finish(run: GradleRun, text: str, *, source: bool = False, not_run: str = "") -> str:
+    """State the outcome of a Gradle run. `source` says the failure is located in project code
+    (compiler errors, failing tests, lint findings); other build failures are not classified,
+    since a broken build script and a broken environment look alike from here."""
+    if run.timed_out:
+        return guard.outcome("timed_out", text, category="unknown")
+    if not run.ok or source:
+        return guard.outcome("failed", text, category="source" if source else "unknown")
+    if not_run:
+        return guard.outcome("not_run", text, reason=not_run)
+    return guard.outcome("passed", text)
 
 
 def _modules(
@@ -164,30 +232,33 @@ def _note_alternatives(task: str, others: list[str]) -> str:
 # ----------------------------------------------------------------------------- project
 
 
-@mcp.tool(annotations=READ)
-async def project_info(project_dir: ProjectDir = None) -> str:
-    """Describe the Gradle build that owns a path: root directory, Gradle/AGP/Kotlin versions,
-    modules, and which static-analysis tools are configured. Reads files only; does not run
-    Gradle."""
+@ops.tool(kind="file", needs=(TARGET, PROJECT), annotations=READ)
+async def project_info(project_dir: ProjectDir = None, expected_root: ExpectedRoot = None) -> str:
+    """Describe the Gradle build that owns a path: root directory, AGP/Kotlin versions,
+    modules, and which static-analysis tools are configured. Reads build scripts only; does not
+    run Gradle. The Gradle version is not reported, because it is recorded in
+    gradle-wrapper.properties, a protected file."""
     project = _project(project_dir)
     root = project.root
+    scope = active()
+
+    def text_of(f: Path) -> str:
+        return scope.read_bytes(f).decode("utf-8", "replace")
 
     def gather() -> str:
         out = [f"Gradle root: {root}", f"Launcher:    {' '.join(project.launcher)}"]
-        props = root / "gradle" / "wrapper" / "gradle-wrapper.properties"
-        if props.is_file() and (m := re.search(r"gradle-([\d.]+(?:-[\w.]+)?)-(?:bin|all)\.zip", props.read_text(errors="replace"))):
-            out.append(f"Gradle:      {m.group(1)}")
+        out.append("Gradle:      not reported (gradle/wrapper/gradle-wrapper.properties is a protected file and is not read)")
         out.append(f"Java:        {os.environ.get('JAVA_HOME') or shutil.which('java') or 'not found (set JAVA_HOME for this server)'}")
 
         build_text = ""
         for name in (*gradle.BUILD_FILES, *gradle.SETTINGS, "gradle/libs.versions.toml"):
             f = root / name
             if f.is_file():
-                build_text += f.read_text(errors="replace") + "\n"
+                build_text += text_of(f) + "\n"
         versions = []
         toml = root / "gradle" / "libs.versions.toml"
         if toml.is_file():
-            for line in toml.read_text(errors="replace").splitlines():
+            for line in text_of(toml).splitlines():
                 if m := re.match(r'^\s*(agp|android[_-]?gradle[_-]?plugin|kotlin|ksp|detekt|ktlint|compose[_-]?bom|java|jvm[_-]?target)\s*=\s*"([^"]+)"', line, re.I):
                     versions.append(f"{m.group(1)}={m.group(2)}")
         if versions:
@@ -208,13 +279,14 @@ async def project_info(project_dir: ProjectDir = None) -> str:
     return await asyncio.to_thread(gather)
 
 
-@mcp.tool(annotations=READ)
+@ops.tool(kind="execution", needs=(PROJECT, EXECUTION), annotations=READ)
 async def gradle_tasks(
     ctx: Context,
     project_dir: ProjectDir = None,
     module: Annotated[str | None, Field(description="Gradle project path, e.g. ':app'. Omit to search every module.")] = None,
     filter: Annotated[str | None, Field(description="Case-insensitive substring of the task name, e.g. 'test' or 'detekt'.")] = None,
     refresh: Annotated[bool, Field(description="Re-query Gradle instead of using the cached task list (after editing build scripts).")] = False,
+    expected_root: ExpectedRoot = None,
 ) -> str:
     """List Gradle tasks. The first call per project runs `gradle tasks --all` (slow on large
     builds) and caches the result. Give `module` or `filter` to keep the list short."""
@@ -237,7 +309,7 @@ async def gradle_tasks(
     return clip(f"{len(lines)} task(s):\n" + "\n".join(lines), 40_000, keep="head")
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+@ops.tool(kind="execution", needs=(PROJECT, EXECUTION), annotations=DESTRUCTIVE)
 async def gradle_run(
     ctx: Context,
     tasks: Annotated[list[str], Field(description="Tasks to run, e.g. [':app:assembleDebug'] or ['clean', 'build'].")],
@@ -245,14 +317,18 @@ async def gradle_run(
     project_dir: ProjectDir = None,
     show_warnings: Annotated[bool, Field(description="List compiler warnings as well as errors.")] = False,
     timeout_sec: Timeout = 1800,
+    expected_root: ExpectedRoot = None,
 ) -> str:
     """Run any Gradle tasks and summarise the result: outcome, failed tasks, compiler and lint
     errors as path:line:col, test failures, and Gradle's 'What went wrong'. The full log is
     saved to a file whose path is returned. Prefer compile / run_tests / detekt / ktlint for
-    those jobs; they pick the right task for you."""
+    those jobs; they pick the right task for you. Arguments that point Gradle at another
+    project (-p, --project-dir, -c, --settings-file, -b, --build-file, --include-build, -I,
+    --init-script) are accepted only when their path is inside expected_root."""
     project = _project(project_dir)
     if not tasks and not args:
         raise ToolError("Give at least one task.")
+    gradle.check_arguments(project, [*tasks, *(args or [])])
     run = await _run(ctx, project, [*tasks, *(args or [])], timeout_sec)
     rep = gradle.parse_output(run.output, project.root)
     extra = ""
@@ -261,14 +337,15 @@ async def gradle_run(
         summary = await asyncio.to_thread(gradle.collect_tests, dirs, run.started)
         if summary.suites:
             extra = summary.render()
-    return format_run(run, rep, show_warnings=show_warnings, extra=extra)
+            return _finish(run, format_run(run, rep, show_warnings=show_warnings, extra=extra), source=bool(rep.errors or summary.failed))
+    return _finish(run, format_run(run, rep, show_warnings=show_warnings, extra=extra), source=bool(rep.errors))
 
 
 def format_run(run: GradleRun, rep: gradle.Report, **kw) -> str:
     return clip(gradle.format_report(run, rep, **kw), 40_000, keep="head")
 
 
-@mcp.tool(name="compile", annotations=ACT)
+@ops.tool(name="compile", kind="execution", needs=(TARGET, PROJECT, EXECUTION), annotations=ACT)
 async def compile_sources(
     ctx: Context,
     project_dir: ProjectDir = None,
@@ -278,6 +355,7 @@ async def compile_sources(
     tests: Annotated[bool, Field(description="Compile unit-test sources too (which also compiles main).")] = False,
     show_warnings: Annotated[bool, Field(description="List compiler warnings as well as errors.")] = False,
     timeout_sec: Timeout = 1200,
+    expected_root: ExpectedRoot = None,
 ) -> str:
     """Compile Kotlin and Java without packaging, and report errors as path:line:col. This is
     the way to check whether an edit is correct. With `file`, only that file's module is
@@ -309,8 +387,8 @@ async def compile_sources(
     rep = gradle.parse_output(run.output, project.root)
     only = {path_key(src)} if src and not module else None
     if only and run.ok and not [d for d in rep.diagnostics if d.key in only]:
-        return f"No problems in {src} ({rep.outcome or 'BUILD SUCCESSFUL'}; ran {' '.join(targets)})."
-    return format_run(run, rep, show_warnings=show_warnings, only_files=only, extra="\n".join(notes))
+        return _finish(run, f"No problems in {src} ({rep.outcome or 'BUILD SUCCESSFUL'}; ran {' '.join(targets)})   [{project.root}]")
+    return _finish(run, format_run(run, rep, show_warnings=show_warnings, only_files=only, extra="\n".join(notes)), source=bool(rep.errors))
 
 
 def _guess_test_module(project: GradleProject, patterns: list[str]) -> str | None:
@@ -326,7 +404,7 @@ def _guess_test_module(project: GradleProject, patterns: list[str]) -> str | Non
     return None
 
 
-@mcp.tool(annotations=ACT)
+@ops.tool(kind="execution", needs=(TARGET, PROJECT, EXECUTION), annotations=ACT)
 async def run_tests(
     ctx: Context,
     project_dir: ProjectDir = None,
@@ -338,16 +416,18 @@ async def run_tests(
     ] = None,
     variant: Variant = "debug",
     timeout_sec: Timeout = 1800,
+    expected_root: ExpectedRoot = None,
 ) -> str:
     """Run JVM unit tests and report counts plus each failure with its message and trimmed
     stack trace. Scope with `file` (one test file), `tests` filters, and/or `module`; with none
     of them every module's unit tests run. When only `tests` is given, the module is located
-    from the test class name."""
+    from the test class name. A run in which no test executed is reported as not_run, never as
+    passed."""
     src = _source(file)
     project = _project(project_dir, file)
     filters = list(tests or [])
     if src and not filters:
-        text = src.read_text(errors="replace")
+        text = active().read_bytes(src).decode("utf-8", "replace")
         pkg = re.search(r"^\s*package\s+([\w.]+)", text, re.M)
         filters = [f"{pkg.group(1)}.{src.stem}" if pkg else src.stem]
     all_tasks = await _tasks(ctx, project)
@@ -390,7 +470,8 @@ async def run_tests(
     if summary.failed:
         # Gradle's own message only says "There were failing tests"; the failures say more.
         rep.what_went_wrong = ""
-    return format_run(run, rep, extra="\n".join([summary.render(), *notes]), tail=not summary.failed)
+    text = format_run(run, rep, extra="\n".join([summary.render(), *notes]), tail=not summary.failed)
+    return _finish(run, text, source=bool(rep.errors or summary.failed), not_run="" if summary.total else "no_tests_executed")
 
 
 # ----------------------------------------------------------------------------- static analysis
@@ -452,11 +533,19 @@ def _lint_result(title: str, run: GradleRun, project: GradleProject, only: set[s
     rep = gradle.parse_output(run.output, project.root)
     findings = [d for d in rep.diagnostics if d.rule]
     if run.timed_out or (not run.ok and not findings):
-        return format_run(run, rep)  # the build itself broke; show why
-    return _findings(title, run, findings, project.root, only)
+        return _finish(run, format_run(run, rep))  # the build itself broke; show why
+    shown = [d for d in findings if only is None or d.key in only]
+    return _lint_outcome(_findings(title, run, findings, project.root, only), bool(shown))
 
 
-@mcp.tool(annotations=ACT)
+def _lint_outcome(text: str, findings: bool) -> str:
+    return guard.outcome("failed", text, category="source") if findings else guard.outcome("passed", text)
+
+
+_TASK_NAME = re.compile(r"[A-Za-z][\w.\-]*")
+
+
+@ops.tool(kind="execution", needs=(TARGET, PROJECT, EXECUTION), annotations=ACT)
 async def detekt(
     ctx: Context,
     project_dir: ProjectDir = None,
@@ -468,10 +557,13 @@ async def detekt(
     auto_correct: Annotated[bool, Field(description="Let detekt fix what it can (needs the formatting ruleset). Modifies files.")] = False,
     task: Annotated[str, Field(description="Detekt task name; e.g. 'detektMain' or 'detektDebug' for type-resolution rules.")] = "detekt",
     timeout_sec: Timeout = 1200,
+    expected_root: ExpectedRoot = None,
 ) -> str:
     """Run detekt and list findings as path:line:col: message [Rule]. Uses the project's Gradle
     detekt task (so its config, baseline and plugins apply); if the build has no such task,
     falls back to a `detekt` CLI on PATH with the project's detekt.yml."""
+    if not _TASK_NAME.fullmatch(task):
+        raise ToolError(f"'{task}' is not a task name. Options and paths are not accepted here.")
     paths = [p for p in (_source(f) for f in files or []) if p]
     project = _project(project_dir, files[0] if files else None)
     tasks = await _tasks(ctx, project)
@@ -498,15 +590,17 @@ async def detekt(
         argv.append("--auto-correct")
     r = await run_proc(argv, cwd=project.root, timeout=timeout_sec)
     diags = gradle.parse_output(r.output, project.root).diagnostics
-    if r.timed_out or (r.code != 0 and not diags):
-        raise ToolError(f"detekt CLI failed (exit {r.code}):\n" + clip(r.output, 6000, keep="tail"))
-    return _findings("detekt (CLI)", None, diags, project.root, only)
+    if r.timed_out:
+        return guard.outcome("timed_out", f"detekt CLI was killed after {timeout_sec}s:\n" + clip(r.output, 6000, keep="tail"), category="unknown")
+    if r.code != 0 and not diags:
+        return guard.outcome("failed", f"detekt CLI failed (exit {r.code}):\n" + clip(r.output, 6000, keep="tail"), category="unknown")
+    return _lint_outcome(_findings("detekt (CLI)", None, diags, project.root, only), any(only is None or d.key in only for d in diags))
 
 
 _KTLINT_TASKS = (("ktlintCheck", "ktlintFormat"), ("lintKotlin", "formatKotlin"), ("spotlessCheck", "spotlessApply"))
 
 
-@mcp.tool(annotations=ACT)
+@ops.tool(kind="execution", needs=(TARGET, PROJECT, EXECUTION), annotations=ACT)
 async def ktlint(
     ctx: Context,
     project_dir: ProjectDir = None,
@@ -517,6 +611,7 @@ async def ktlint(
     ] = None,
     format: Annotated[bool, Field(description="Fix style violations in place instead of only reporting them. Modifies files.")] = False,
     timeout_sec: Timeout = 1200,
+    expected_root: ExpectedRoot = None,
 ) -> str:
     """Check Kotlin code style, or reformat with format=true. Uses the project's Gradle tasks
     (ktlintCheck/ktlintFormat, lintKotlin/formatKotlin, or spotlessCheck/spotlessApply); if the
@@ -533,7 +628,7 @@ async def ktlint(
         if run is None:
             continue
         if format and run.ok:
-            return f"Formatted with {name} ({gradle.parse_output(run.output, project.root).outcome or 'done'}).\nFull log: {run.log}"
+            return _finish(run, f"Formatted with {name} ({gradle.parse_output(run.output, project.root).outcome or 'done'}).\nFull log: {run.log}")
         return _lint_result(f"ktlint ({name})", run, project, only)
 
     cli = _find_cli("KTLINT_CLI", "ktlint")
@@ -552,17 +647,19 @@ async def ktlint(
             targets += [f"{prefix}**/*.kt", f"{prefix}**/*.kts"]
     r = await run_proc([cli, *(["-F"] if format else []), *targets], cwd=project.root, timeout=timeout_sec)
     diags = gradle.parse_output(r.output, project.root).diagnostics
-    if r.timed_out or (r.code != 0 and not diags):
-        raise ToolError(f"ktlint CLI failed (exit {r.code}):\n" + clip(r.output, 6000, keep="tail"))
+    if r.timed_out:
+        return guard.outcome("timed_out", f"ktlint CLI was killed after {timeout_sec}s:\n" + clip(r.output, 6000, keep="tail"), category="unknown")
+    if r.code != 0 and not diags:
+        return guard.outcome("failed", f"ktlint CLI failed (exit {r.code}):\n" + clip(r.output, 6000, keep="tail"), category="unknown")
     title = "ktlint (CLI, formatted; remaining" if format else "ktlint (CLI"
-    return _findings(title + ")", None, diags, project.root, only)
+    return _lint_outcome(_findings(title + ")", None, diags, project.root, only), any(only is None or d.key in only for d in diags))
 
 
 _DEP_LINE = re.compile(r"^[| ]*[+\\]--- (?P<coord>[^\s:]+:[^\s:]+)(?::(?P<ver>[^\s:]+))?(?: -> (?P<res>\S+))?")
 _PROJECT_DEP = re.compile(r"^[| ]*[+\\]--- project (?P<path>:\S*)")
 
 
-@mcp.tool(annotations=READ)
+@ops.tool(kind="execution", needs=(PROJECT, EXECUTION), annotations=READ)
 async def dependencies(
     ctx: Context,
     project_dir: ProjectDir = None,
@@ -574,6 +671,7 @@ async def dependencies(
     filter: Annotated[str | None, Field(description="Case-insensitive substring to keep, e.g. 'okhttp' or 'androidx.compose'.")] = None,
     tree: Annotated[bool, Field(description="Return Gradle's dependency tree instead of the flat resolved list.")] = False,
     timeout_sec: Timeout = 600,
+    expected_root: ExpectedRoot = None,
 ) -> str:
     """List a module's resolved dependencies (group:name:version, after conflict resolution)
     plus the project modules it depends on. Use filter to find a library, tree=true to see
@@ -587,7 +685,7 @@ async def dependencies(
         configuration = "debugRuntimeClasspath" if android else "runtimeClasspath"
     run = await _run(ctx, project, [task_path(m, "dependencies"), "--configuration", configuration], timeout_sec)
     if not run.ok:
-        return format_run(run, gradle.parse_output(run.output, project.root))
+        return _finish(run, format_run(run, gradle.parse_output(run.output, project.root)))
     needle = filter.lower() if filter else None
     lines = [ln for ln in run.output.splitlines() if _DEP_LINE.match(ln) or _PROJECT_DEP.match(ln)]
     if not lines:
@@ -626,30 +724,34 @@ def _package(text: str) -> str:
 def _sources(root: Path, file_glob: str | None, extra_suffixes: tuple[str, ...] = ()) -> list[Path]:
     match = glob_matcher(file_glob)
     suffixes = symbols.SOURCE_SUFFIXES + extra_suffixes
-    return sorted(f for f in iter_files(root) if (file_glob or f.suffix in suffixes) and match(rel(f, root)))
+    return sorted(
+        f for f in iter_files(root)
+        if (file_glob or f.suffix in suffixes) and not protected_name(f.name) and match(rel(f, root))
+    )
 
 
 def _read(f: Path) -> str | None:
+    """Text of a source file inside the request scope; None for anything that cannot or must
+    not be read (too large, not UTF-8, protected, or resolving outside the scope)."""
     try:
-        if f.stat().st_size > 2_000_000:
-            return None
-        return f.read_bytes().decode("utf-8")
-    except (OSError, UnicodeDecodeError):
+        return active().read_bytes(f, 2_000_000).decode("utf-8")
+    except (OSError, UnicodeDecodeError, ToolError):
         return None
 
 
-@mcp.tool(annotations=READ)
+@ops.tool(kind="file", needs=(TARGET,), annotations=READ)
 async def find_symbol(
     name: Annotated[str, Field(description="Simple name of a class, function, property, object or typealias.")],
     root: SearchRoot = None,
     kind: Annotated[Kind | None, Field(description="Only declarations of this kind.")] = None,
     exact: Annotated[bool, Field(description="Match the whole name. False finds names containing it, case-insensitively.")] = True,
     limit: Annotated[int, Field(ge=1, le=200)] = 25,
+    expected_root: ExpectedRoot = None,
 ) -> str:
     """Find where a Kotlin or Java symbol is declared. Returns each declaration's location,
     package, signature and doc comment. Matching is by name from source text, so overloads and
     same-named symbols in different packages are all listed."""
-    base = existing_dir(root)
+    base = active().dir(root)
     needle = name.lower()
 
     def scan() -> list[str]:
@@ -681,15 +783,16 @@ async def find_symbol(
     return clip(out, 40_000, keep="head")
 
 
-@mcp.tool(annotations=READ)
+@ops.tool(kind="file", needs=(TARGET,), annotations=READ)
 async def file_outline(
     path: Annotated[str, Field(description="Absolute path of a .kt, .kts or .java file.")],
+    expected_root: ExpectedRoot = None,
 ) -> str:
     """List the declarations in a Kotlin or Java file (classes, functions, properties) with
     line numbers, nested by containing class. A quick way to see a large file's structure."""
     p = _source(path)
     assert p is not None
-    text = await asyncio.to_thread(p.read_text, "utf-8", "replace")
+    text = (await asyncio.to_thread(active().read_bytes, p)).decode("utf-8", "replace")
     lines = text.splitlines()
     syms = symbols.outline(text, java=p.suffix == ".java")
     if not syms:
@@ -720,96 +823,67 @@ def _usage_scan(base: Path, name: str, file_glob: str | None) -> list[tuple[Path
     return results
 
 
-async def _text_find_usages(name: str, root: str | None, file_glob: str | None, include_imports: bool, limit: int) -> str:
-    """Whole-word text match over Kotlin, Java and XML sources."""
-    base = existing_dir(root)
+def _provenance(engine: str, requested: str, root: Path, complete: bool, reason: str = "") -> str:
+    """First line of every navigation and rename result: the engine that actually produced it
+    (not merely the one asked for), the project root actually used, and whether the listing is
+    the whole answer within the query's scope."""
+    return (
+        f"[engine={engine} requested={requested} project={root} complete={'true' if complete else 'false'}"
+        + (f" incomplete_reason={reason}" if reason and not complete else "")
+        + "]"
+    )
+
+
+def _page(rows: list, offset: int, limit: int) -> tuple[list, bool, str]:
+    """One bounded page of a result: (rows shown, whether the end was reached, continuation note)."""
+    shown = rows[offset : offset + limit]
+    end = offset + len(shown)
+    if end >= len(rows):
+        return shown, True, ""
+    return shown, False, f"[showing {offset + 1}-{end} of {len(rows)}; continue with offset={end}, or narrow the query]"
+
+
+async def _text_find_usages(
+    name: str, root: str | None, file_glob: str | None, include_imports: bool, limit: int, offset: int = 0,
+    requested: str = "text", why: str = "",
+) -> str:
+    """Whole-word text match over Kotlin, Java and XML sources. Read-only, and never presented
+    as symbol resolution."""
+    base = active().dir(root)
     results = await asyncio.to_thread(_usage_scan, base, name, file_glob)
     counts = {"usage": 0, "declaration": 0, "import": 0, "comment": 0}
-    out: list[str] = []
-    shown = 0
+    rows: list[tuple[str, str]] = []
     for f, hits in results:
-        lines = []
         for line_no, cls, text in hits:
             counts[cls] += 1
             if cls == "import" and not include_imports:
                 continue
-            if shown < limit:
-                tag = {"usage": " ", "declaration": "D", "comment": "#", "import": "I"}[cls]
-                lines.append(f"  {line_no:>5} {tag} {text[:240]}")
-                shown += 1
-        if lines:
-            out.append(rel(f, base))
-            out.extend(lines)
-    total = sum(counts.values())
-    if not total:
-        return f"'{name}' does not appear under {base}."
-    listed = total - (0 if include_imports else counts["import"])
-    header = (
+            tag = {"usage": " ", "declaration": "D", "comment": "#", "import": "I"}[cls]
+            rows.append((rel(f, base), f"  {line_no:>5} {tag} {text[:240]}"))
+    out = [
+        _provenance("text", requested, base, False, "text_match"),
+        "Text matches of the identifier, not confirmed references to one symbol: same-named symbols, comments and "
+        "strings are included, and nothing here was resolved.",
+    ]
+    if why:
+        out.append(f"Semantic resolution was requested through engine='auto' but not used: {why}")
+    if not rows and not sum(counts.values()):
+        return "\n".join(out + [f"'{name}' does not appear under {base}."])
+    shown, _end, more = _page(rows, offset, limit)
+    out.append(
         f"'{name}' under {base}: {counts['usage']} usage(s), {counts['declaration']} declaration(s), "
         f"{counts['import']} import(s), {counts['comment']} in comments, across {len(results)} file(s)."
         "  [D = declaration, # = comment" + (", I = import" if include_imports else "") + "]"
     )
-    if listed > shown:
-        header += f"\nShowing {shown} of {listed} lines; narrow with root or file_glob."
-    return clip(header + "\n" + "\n".join(out), 50_000, keep="head")
-
-
-async def _text_rename(name: str, new_name: str, root: str | None, file_glob: str | None, dry_run: bool, rename_files: bool) -> str:
-    """Whole-word replacement in Kotlin, Java and XML files; does not resolve symbols."""
-    base = existing_dir(root)
-    rx, new_rx = symbols.word_regex(name), symbols.word_regex(new_name)
-
-    def work() -> str:
-        changes: list[tuple[Path, int, list[str]]] = []
-        clashes: list[str] = []
-        moves: list[tuple[Path, Path]] = []
-        for f in _sources(base, file_glob, (".xml",)):
-            text = _read(f)
-            if text is None or name not in text:
-                continue
-            updated, n = rx.subn(new_name, text)
-            if not n:
-                continue
-            if new_rx.search(text):
-                clashes.append(rel(f, base))
-            preview = [f"  {i + 1:>5}  {ln.strip()[:200]}" for i, ln in enumerate(text.splitlines()) if rx.search(ln)]
-            changes.append((f, n, preview))
-            target = f.with_name(new_name + f.suffix)
-            declares_type = f.stem == name and symbols.is_source(f) and any(
-                s.name == name and not s.container and s.kind not in ("fun", "val", "var")
-                for s in symbols.outline(text, java=f.suffix == ".java")
-            )
-            if not dry_run:
-                f.write_bytes(updated.encode("utf-8"))
-            if rename_files and declares_type:
-                if target.exists():
-                    clashes.append(f"{rel(target, base)} already exists; file not renamed")
-                else:
-                    moves.append((f, target))
-                    if not dry_run:
-                        f.rename(target)
-        if not changes:
-            return f"'{name}' does not appear under {base}; nothing to rename."
-        total = sum(n for _, n, _ in changes)
-        verb = "Would rename" if dry_run else "Renamed"
-        out = [f"{verb} {total} occurrence(s) of '{name}' to '{new_name}' in {len(changes)} file(s) under {base}."]
-        if clashes:
-            out.append(f"WARNING: '{new_name}' already occurs in: " + ", ".join(clashes[:15]) + ". Check for name clashes.")
-        for src, dst in moves:
-            out.append(f"{'Would move' if dry_run else 'Moved'} {rel(src, base)} -> {dst.name}")
-        budget = 120
-        for f, n, preview in changes:
-            out.append(f"{rel(f, base)} ({n})")
-            if dry_run and budget > 0:
-                out.extend(preview[:budget])
-                budget -= len(preview)
-        if dry_run:
-            out.append("\nNothing was written. Call again with dry_run=false to apply.")
-        else:
-            out.append("\nRun compile to verify.")
-        return "\n".join(out)
-
-    return clip(await asyncio.to_thread(work), 50_000, keep="head")
+    last = None
+    for shown_file, line in shown:
+        if shown_file != last:
+            out.append(shown_file)
+            last = shown_file
+        out.append(line)
+    if more:
+        out.append(more)
+    return clip("\n".join(out), 50_000, keep="head")
 
 
 # ----------------------------------------------------------------------------- code-aware tools
@@ -817,8 +891,18 @@ async def _text_rename(name: str, new_name: str, root: str | None, file_glob: st
 Engine = Annotated[
     Literal["auto", "semantic", "text"],
     Field(
-        description="'semantic' resolves the symbol with the Kotlin language server; 'text' matches the "
-        "identifier as a whole word. 'auto' uses semantic when the language server is installed."
+        description="'semantic' resolves the symbol with the Kotlin language server and is an error when that is "
+        "not possible. 'text' is a read-only whole-word search that does not tell same-named symbols apart. 'auto' "
+        "uses semantic resolution and, only when the language server is missing, still indexing or could not import "
+        "the project, returns text matches instead, labelled as such with the reason. The first line of the result "
+        "always states the engine actually used."
+    ),
+]
+RenameEngine = Annotated[
+    Literal["semantic", "auto", "text"],
+    Field(
+        description="Renaming is always semantic. 'auto' means 'semantic' here and never selects text replacement. "
+        "'text' is rejected: this tool does not perform whole-word replacement."
     ),
 ]
 AtFile = Annotated[
@@ -826,43 +910,69 @@ AtFile = Annotated[
     Field(description="Absolute path of a file where the symbol appears (declaration or any usage). Needed when the name is not unique."),
 ]
 AtLine = Annotated[int | None, Field(description="1-based line in `file` where the symbol appears.", ge=1)]
+AtColumn = Annotated[
+    int | None,
+    Field(description="1-based column of the identifier on that line. Needed when the name occurs more than once on the line.", ge=1),
+]
+Limit = Annotated[int, Field(description="Maximum entries to list.", ge=1, le=2000)]
+Offset = Annotated[int, Field(description="Entries to skip, to continue a truncated listing.", ge=0)]
 
 _SYMBOL_KINDS = {
     2: "module", 3: "namespace", 4: "package", 5: "class", 6: "method", 7: "property", 8: "field", 9: "constructor",
     10: "enum", 11: "interface", 12: "function", 13: "variable", 14: "constant", 22: "enum member", 23: "struct", 26: "type parameter",
 }
 _SEVERITY = {1: "error", 2: "warning", 3: "info", 4: "hint"}
+_STATIC_NOTE = (
+    "These are static, direct relationships resolved by the language server. This is not a runtime order: coroutine "
+    "scheduling, event dispatch and dynamic dispatch are not modelled, and chains are not followed. Query a result "
+    "in turn to go one step further."
+)
 
 
 def _workspace_root(root: str | None, file: str | None) -> Path:
-    """Project the language server should import: the Gradle root when there is one."""
+    """Verified project the language server should import: the Gradle root when there is one,
+    otherwise the request scope itself."""
     try:
-        return gradle.find_project(root or file).root
+        return _project(root or file).root
+    except Blocked:
+        raise
     except ToolError:
-        if root:
-            return existing_dir(root)
-        if file:
-            return resolve(file).parent
-        return existing_dir(None)
+        scope = active()
+        scope.check(root or file or scope.root, protected=False)
+        return scope.check_project(scope.root)
 
 
-def _use_semantic(engine: str) -> bool:
-    if engine == "text":
-        return False
+def _require_server(alternative: str) -> None:
     if lsp.find_server() is None:
-        if engine == "semantic":
-            raise ToolError(lsp.NOT_INSTALLED)
-        return False
-    return True
+        raise lsp.LspError(lsp.NOT_INSTALLED + " " + alternative, "semantic_not_installed")
 
 
 async def _session(ctx: Context | None, root: Path, timeout: float = 600.0) -> lsp.Session:
-    """The language server session for a project. Raises when its import failed or was partial,
-    because answers from an incomplete model look complete and are not."""
+    """The language server session for a verified project. Raises unless the session is bound
+    to that project and has reported a complete import: answers from a session for another
+    worktree would be about other code, and answers from an incomplete model look complete and
+    are not. The state is established here on every call, never taken from an earlier one."""
     async with Progress(ctx) as p:
         s = await lsp.session_for(root, timeout, lambda message: setattr(p, "last", message))
-    if why := s.unreliable():
-        raise lsp.LspError("Code-aware analysis is unavailable for this project: " + why)
+    state, reason, detail = s.state(identity(root))
+    if state != "ready":
+        raise lsp.LspError(
+            f"Code-aware analysis is blocked for {root}: {detail} No text match was substituted.",
+            reason or "semantic_unavailable",
+        )
+    return s
+
+
+async def _semantic(ctx: Context | None, root: str | None, file: str | None, alternative: str, *methods: str) -> lsp.Session:
+    """Everything a code-aware operation checks before its first query: the targets, the
+    project, an installed server, a ready session bound to that project, and backend support
+    for each request the operation is going to make."""
+    _source(file)  # a file to resolve the symbol in is a target too
+    workspace = _workspace_root(root, file)
+    _require_server(alternative)
+    s = await _session(ctx, workspace)
+    for method in methods:
+        s.verify(method)
     return s
 
 
@@ -870,25 +980,21 @@ def _require_imported(s: lsp.Session, path: Path) -> None:
     if s.left_out(path):
         raise lsp.LspError(
             f"{path} was left out of the language server's import (workaround for Kotlin/kotlin-lsp#253 "
-            "on Android test sources), so it cannot be analysed. Use compile or detekt for it."
+            "on Android test sources), so it cannot be analysed. Use compile or detekt for it.",
+            "semantic_import_failed",
         )
 
 
-async def _session_or_text(ctx: Context | None, root: Path, engine: str) -> tuple[lsp.Session | None, str]:
-    """For tools with a text fallback: the session, or None plus a note saying why text matching
-    is used instead. engine='semantic' never falls back."""
-    try:
-        return await _session(ctx, root), ""
-    except lsp.LspError as e:
-        if engine == "semantic":
-            raise
-        return None, f"[text match, same-named symbols are not told apart. {e}]\n"
+def _ambiguous(message: str) -> OutcomeError:
+    return OutcomeError("failed", message, category="input", reason="ambiguous_symbol")
 
 
 async def _locate(
     s: lsp.Session, name: str | None, file: str | None, line: int | None, column: int | None = None
 ) -> tuple[Path, dict]:
-    """Resolve what the caller pointed at into a document position the server understands."""
+    """Resolve what the caller pointed at into exactly one document position, in the UTF-16
+    columns the server uses. Anything that could mean more than one occurrence is rejected with
+    the candidates, never settled by taking the first."""
     if file:
         path = _source(file)
         assert path is not None
@@ -898,33 +1004,53 @@ async def _locate(
             if line > len(lines):
                 raise ToolError(f"{path} has only {len(lines)} lines.")
             text = lines[line - 1]
+            found = list(rx.finditer(text)) if rx else []
             if column is not None:
                 idx = column - 1
-            elif rx and (m := rx.search(text)):
-                idx = m.start()
+                if idx > len(text) or (rx and not any(m.start() <= idx < m.end() for m in found)):
+                    at = ", ".join(f"column={m.start() + 1}" for m in found) or "nowhere on this line"
+                    raise ToolError(f"'{name}' is not at column {column} of line {line} in {path} (it is at {at}): {text.strip()[:120]}")
+            elif len(found) == 1:
+                idx = found[0].start()
+            elif found:
+                raise _ambiguous(
+                    f"'{name}' occurs {len(found)} times on line {line} of {path}. Call again with one of: "
+                    + ", ".join(f"column={m.start() + 1}" for m in found[:30])
+                    + f"\n  {text.strip()[:200]}"
+                )
             elif rx:
                 raise ToolError(f"'{name}' does not appear on line {line} of {path}: {text.strip()[:120]}")
             else:
                 raise ToolError("Give `name` (the identifier on that line) or `column`.")
             return path, {"line": line - 1, "character": lsp.utf16_col(text, idx)}
         if not rx:
-            raise ToolError("Give `line`, or `name` to use its first occurrence in the file.")
-        for i, text in enumerate(lines):
-            if not text.lstrip().startswith(("import ", "package ", "//", "*", "/*")) and (m := rx.search(text)):
-                return path, {"line": i, "character": lsp.utf16_col(text, m.start())}
-        raise ToolError(f"'{name}' does not appear in {path}.")
+            raise ToolError("Give `line`, or `name` when it occurs once in the file.")
+        hits = [
+            (i, m) for i, text in enumerate(lines)
+            if not text.lstrip().startswith(("import ", "package ", "//", "*", "/*"))
+            for m in rx.finditer(text)
+        ]
+        if not hits:
+            raise ToolError(f"'{name}' does not appear in {path}.")
+        if len(hits) > 1:
+            raise _ambiguous(
+                f"'{name}' occurs {len(hits)} times in {path}. Call again with `line` (and `column`) of the one you mean:\n"
+                + "\n".join(f"  line={i + 1} column={m.start() + 1}: {lines[i].strip()[:160]}" for i, m in hits[:30])
+                + (f"\n  [... {len(hits) - 30} more ...]" if len(hits) > 30 else "")
+            )
+        i, m = hits[0]
+        return path, {"line": i, "character": lsp.utf16_col(lines[i], m.start())}
 
     if not name:
         raise ToolError("Give `name`, or `file` and `line`.")
     found = await s.request("workspace/symbol", {"query": name}) or []
-    root_key = path_key(s.root)
     exact = []
     for sym in found:
         loc = sym.get("location") or {}
         if sym.get("name") != name or "range" not in loc:
             continue
         p = lsp.path_of(loc["uri"])
-        if path_key(p).startswith(root_key):
+        if within(p, s.root):
             exact.append((p, loc["range"]["start"], sym))
     if not exact:
         raise ToolError(
@@ -937,27 +1063,69 @@ async def _locate(
             f"  -> file={p} line={pos['line'] + 1}"
             for p, pos, sym in exact[:30]
         )
-        raise ToolError(f"'{name}' is declared in {len(exact)} places. Call again with `file` and `line` of the one you mean:\n{listing}")
+        raise _ambiguous(f"'{name}' is declared in {len(exact)} places. Call again with `file` and `line` of the one you mean:\n{listing}")
     return exact[0][0], exact[0][1]
 
 
-def _line_text(cache: dict[str, list[str]], path: Path, line: int) -> str:
+def _file_lines(cache: dict[str, list[str] | None], path: Path) -> list[str] | None:
+    """Lines of a source file inside the request scope, or None when it is outside it (library
+    and JDK sources) or cannot be read."""
     key = str(path)
     if key not in cache:
         try:
-            cache[key] = path.read_bytes().decode("utf-8", "replace").splitlines()
-        except OSError:
-            cache[key] = []
-    return cache[key][line].strip()[:240] if line < len(cache[key]) else ""
+            cache[key] = active().read_bytes(path).decode("utf-8", "replace").splitlines()
+        except (OSError, ToolError):
+            cache[key] = None
+    return cache[key]
 
 
-def _where(path: Path, root: Path) -> str:
-    """Project-relative path, or a readable form for library and JDK sources."""
-    text = rel(path, root)
-    return text
+def _line_text(cache: dict[str, list[str] | None], path: Path, line: int) -> str:
+    lines = _file_lines(cache, path) or []
+    return lines[line].strip()[:240] if line < len(lines) else ""
 
 
-@mcp.tool(annotations=READ)
+def _as_list(result: object) -> list[dict]:
+    if isinstance(result, dict):
+        return [result]
+    return [r for r in result or [] if isinstance(r, dict)]  # type: ignore[union-attr]
+
+
+def _target(location: dict) -> tuple[str, dict]:
+    """(uri, start position) of an LSP Location or LocationLink."""
+    return location.get("uri") or location.get("targetUri") or "", (location.get("range") or location.get("targetSelectionRange") or {}).get("start") or {"line": 0, "character": 0}
+
+
+async def _describe(s: lsp.Session, name: str, doc: dict, cache: dict[str, list[str] | None]) -> tuple[str, str, list[dict]]:
+    """The selected symbol as the language server resolved it: where it is declared and its
+    signature. Returns (text for the result, a key identifying the declaration, declarations).
+    The key is the backend's own declaration location, valid only until that file changes."""
+    decls = _as_list(await s.request("textDocument/definition", doc))
+    if not decls:
+        return f"symbol: {name}, declaration not resolved by the language server", "unresolved", decls
+    uri, start = _target(decls[0])
+    key = f"{uri}#{start['line']}:{start['character']}"
+    if not uri.startswith("file:"):
+        return f"symbol: {name}, declared in {uri}", key, decls
+    path = lsp.path_of(uri)
+    text = f"symbol: {name}, declared at {rel(path, s.root)}:{start['line'] + 1}"
+    lines = _file_lines(cache, path)
+    if lines and start["line"] < len(lines):
+        text += "\n" + "\n".join("  " + ln.strip() for ln in symbols.signature(lines, start["line"] + 1).splitlines()[:4])
+    if len(decls) > 1:
+        text += f"\n  (and {len(decls) - 1} more declaration(s) of the same symbol)"
+    return text, key, decls
+
+
+def _completeness(s: lsp.Session, reached_end: bool) -> tuple[bool, str, str]:
+    """(complete, reason, note) for a semantic listing from a ready session."""
+    if caveat := s.caveat():
+        return False, "partial_import", caveat.strip() + "\nAn empty or short answer is not proof that nothing else exists in the sources left out."
+    if not reached_end:
+        return False, "truncated", ""
+    return True, "", ""
+
+
+@ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=READ)
 async def find_usages(
     ctx: Context,
     name: Annotated[str, Field(description="Identifier to find usages of.")],
@@ -968,33 +1136,44 @@ async def find_usages(
     file_glob: Annotated[str | None, Field(description="Only list results in files matching this glob.")] = None,
     include_imports: Annotated[bool, Field(description="Also list import lines.")] = False,
     limit: Annotated[int, Field(description="Maximum lines to list.", ge=1, le=2000)] = 150,
+    column: AtColumn = None,
+    offset: Offset = 0,
+    expected_root: ExpectedRoot = None,
 ) -> str:
-    """Find usages of a symbol across the project. With the Kotlin language server installed this
-    is code-aware, like Find Usages in the IDE: it lists references to that one symbol and
-    ignores unrelated symbols with the same name. If the name is declared more than once, the
-    error lists the candidates; call again with `file` and `line`. Without the language server
-    (or with engine='text') it is a whole-word text search, labelled as such."""
-    if not _use_semantic(engine):
-        note = "" if engine == "text" else "[text match; the Kotlin language server is not installed, so same-named symbols are not told apart]\n"
-        return note + await _text_find_usages(name, root, file_glob, include_imports, limit)
+    """Find usages of a symbol across the project. With the Kotlin language server this is
+    code-aware, like Find Usages in the IDE: references to that one symbol, ignoring unrelated
+    symbols with the same name. A name declared more than once, or occurring more than once on
+    the given line, is rejected with the candidates; call again with `file`, `line` and, if
+    needed, `column`.
 
-    s, note = await _session_or_text(ctx, _workspace_root(root, file), engine)
-    if s is None:
-        return note + await _text_find_usages(name, root, file_glob, include_imports, limit)
+    The first line states how the result was obtained: `[engine=... requested=... project=...
+    complete=...]`, followed by the declaration the symbol resolved to. `complete=false` comes
+    with a reason: `truncated` (continue with `offset`), `partial_import` (part of the project
+    is not in the language server's model, so an empty answer proves nothing) or `text_match`.
+    engine='semantic' is an error when the language server is missing, still indexing or could
+    not import the project. engine='auto' then returns whole-word text matches instead, labelled
+    as unresolved text matches with the reason; a scope or permission rejection is never
+    answered that way. engine='text' asks for the text search directly."""
+    if engine == "text":
+        return await _text_find_usages(name, root, file_glob, include_imports, limit, offset)
+    try:
+        s = await _semantic(ctx, root, file, "For a whole-word text search instead, call again with engine='text'.", "textDocument/references")
+    except lsp.LspError as e:
+        if engine != "auto" or e.category != "environment":
+            raise
+        return await _text_find_usages(name, root, file_glob, include_imports, limit, offset, "auto", f"{e.reason}: {e.detail}")
+    cache: dict[str, list[str] | None] = {}
     async with s.lock:
         await s.sync()
-        path, pos = await _locate(s, name, file, line)
+        path, pos = await _locate(s, name, file, line, column)
         s.open(path)
         doc = {"textDocument": {"uri": lsp.uri_of(path)}, "position": pos}
+        symbol, _key, decls = await _describe(s, name, doc, cache)
         refs = await s.request("textDocument/references", {**doc, "context": {"includeDeclaration": True}}) or []
-        decls = await s.request("textDocument/definition", doc) or []
-    if isinstance(decls, dict):
-        decls = [decls]
-    decl_keys = {(path_key(lsp.path_of(d.get("uri") or d.get("targetUri"))), (d.get("range") or d.get("targetSelectionRange"))["start"]["line"]) for d in decls}
+    decl_keys = {(path_key(lsp.path_of(uri)), start["line"]) for uri, start in map(_target, decls)}
     match = glob_matcher(file_glob)
-    cache: dict[str, list[str]] = {}
-    by_file: dict[str, list[tuple[int, str, str]]] = {}
     counts = {"usage": 0, "declaration": 0, "import": 0}
+    rows: set[tuple[str, int, str, str]] = set()
     for r in refs:
         p = lsp.path_of(r["uri"])
         ln = r["range"]["start"]["line"]
@@ -1003,31 +1182,37 @@ async def find_usages(
             continue
         text = _line_text(cache, p, ln)
         kind = "declaration" if (path_key(p), ln) in decl_keys else "import" if text.startswith("import ") else "usage"
+        if (shown, ln + 1, {"usage": " ", "declaration": "D", "import": "I"}[kind], text) in rows:
+            continue
         counts[kind] += 1
         if kind == "import" and not include_imports:
             continue
-        by_file.setdefault(shown, []).append((ln + 1, {"usage": " ", "declaration": "D", "import": "I"}[kind], text))
+        rows.add((shown, ln + 1, {"usage": " ", "declaration": "D", "import": "I"}[kind], text))
+    listed, reached_end, more = _page(sorted(rows), offset, limit)
+    complete, reason, note = _completeness(s, reached_end)
+    out = [_provenance("semantic", engine, s.root, complete, reason), symbol]
+    if note:
+        out.append(note)
     if not refs:
-        return s.caveat() + f"No references to '{name}' found by the language server in {s.root}."
-    out = [
-        s.caveat() + f"'{name}' in {s.root}: {counts['usage']} usage(s), {counts['declaration']} declaration(s), {counts['import']} import(s) "
-        f"across {len(by_file)} file(s).  [code-aware; D = declaration" + (", I = import" if include_imports else "") + "]"
-    ]
-    shown_lines = 0
-    for f in sorted(by_file):
-        if shown_lines >= limit:
-            break
-        out.append(f)
-        for ln, tag, text in sorted(set(by_file[f]))[: limit - shown_lines]:
-            out.append(f"  {ln:>5} {tag} {text}")
-            shown_lines += 1
-    total = sum(len(set(v)) for v in by_file.values())
-    if total > shown_lines:
-        out.append(f"[... {total - shown_lines} more lines; narrow with file_glob or raise limit ...]")
+        out.append(f"No references to '{name}' found by the language server in {s.root}.")
+        return "\n".join(out)
+    out.append(
+        f"'{name}': {counts['usage']} usage(s), {counts['declaration']} declaration(s), {counts['import']} import(s) "
+        f"on {len(rows)} listed line(s)" + (f" matching {file_glob}" if file_glob else "")
+        + ".  [D = declaration" + (", I = import" if include_imports else "") + "]"
+    )
+    last = None
+    for shown, ln, tag, text in listed:
+        if shown != last:
+            out.append(shown)
+            last = shown
+        out.append(f"  {ln:>5} {tag} {text}")
+    if more:
+        out.append(more)
     return clip("\n".join(out), 50_000, keep="head")
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+@ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=DESTRUCTIVE)
 async def rename_symbol(
     ctx: Context,
     name: Annotated[str, Field(description="Current identifier.")],
@@ -1035,86 +1220,328 @@ async def rename_symbol(
     root: SearchRoot = None,
     file: AtFile = None,
     line: AtLine = None,
-    engine: Engine = "auto",
-    dry_run: Annotated[bool, Field(description="Only report what would change. Set false to write the changes.")] = True,
-    rename_files: Annotated[bool, Field(description="Also rename Name.kt / Name.java when the file declares the renamed type.")] = True,
-    file_glob: Annotated[str | None, Field(description="Text engine only: limit to files matching this glob.")] = None,
+    engine: RenameEngine = "semantic",
+    dry_run: Annotated[bool, Field(description="True (the default) previews and writes nothing. False applies the previewed edit set and requires preview_id.")] = True,
+    rename_files: Annotated[bool, Field(description="Also rename Name.kt / Name.java when the file declares the renamed top-level type.")] = True,
+    column: AtColumn = None,
+    preview_id: Annotated[
+        str | None,
+        Field(description="The preview_id returned by the dry run, required with dry_run=false. The edit set is recomputed and applied only if it is identical to the one previewed."),
+    ] = None,
+    expected_root: ExpectedRoot = None,
 ) -> str:
-    """Rename a symbol everywhere it is used. With the Kotlin language server installed this is
-    the IDE's rename refactoring: only references to that one symbol change, and unrelated
-    symbols with the same name are left alone. If the name is declared more than once, the error
-    lists the candidates; call again with `file` and `line`. It defaults to a dry run that shows
-    every affected line; pass dry_run=false to apply, then compile. Without the language server
-    (or with engine='text') it replaces the identifier as a whole word in all sources under root,
-    which also hits same-named symbols, comments and strings."""
+    """Rename a symbol everywhere it is used, with the language server's rename refactoring:
+    only references to that one symbol change; same-named symbols, comments and strings are
+    left alone. It is never a text replacement, whatever `engine` says, and it is blocked with
+    the reason when the language server is missing, still indexing, could not import the
+    project or does not offer rename.
+
+    It works in two calls. The first (dry_run omitted or true) writes nothing and returns the
+    declaration the symbol resolved to, every affected line, any declaration-file move, the
+    revision of each file the edits were computed against, and a `preview_id`. The second
+    repeats the same arguments with dry_run=false and that preview_id. Before the first write
+    the project, the session, the symbol and the edit set are established again and every file
+    is re-read: if anything differs from what was previewed (a file was edited, the server
+    resolves the symbol differently, the project or session changed), the call is rejected with
+    `stale_preview` and nothing is written; it does not apply a regenerated edit set. A name
+    that is ambiguous, an edit outside expected_root, a protected file or an existing file at a
+    move destination also rejects the whole rename.
+
+    Files are written one at a time and are not rolled back: if a write fails part-way, the
+    error lists what was and was not written. Run compile afterwards."""
     if not symbols.is_identifier(name) or not symbols.is_identifier(new_name):
         raise ToolError("name and new_name must be plain identifiers (letters, digits, underscore).")
     if name == new_name:
         raise ToolError("new_name is the same as name.")
-    if not _use_semantic(engine):
-        note = "" if engine == "text" else "[text replacement; the Kotlin language server is not installed, so same-named symbols are not told apart]\n"
-        return note + await _text_rename(name, new_name, root, file_glob, dry_run, rename_files)
-
-    s, note = await _session_or_text(ctx, _workspace_root(root, file), engine)
-    if s is None:
-        # Never write a text-based rename the caller did not ask for: show what it would do.
-        preview = await _text_rename(name, new_name, root, file_glob, True, rename_files)
-        if dry_run:
-            return note + preview
-        return (
-            note + "Nothing was written. A text replacement would affect every symbol with this name:\n"
-            + preview.replace("\nNothing was written. Call again with dry_run=false to apply.", "")
-            + "\nTo apply it anyway, call again with engine='text' and dry_run=false."
+    if engine == "text":
+        raise Blocked(
+            "text_rename_rejected",
+            "rename_symbol does not perform whole-word text replacement: it would also change unrelated symbols with "
+            "the same name, comments and strings. Use engine='semantic'. To see where the identifier occurs as text, "
+            "use find_usages(engine='text'), which is read-only; a deliberate textual edit is a job for the files "
+            "server's replace_text, one reviewed file at a time.",
         )
+    s = await _semantic(ctx, root, file, "Renaming needs it; no text replacement is made in its place.", "textDocument/rename")
+    cache: dict[str, list[str] | None] = {}
     async with s.lock:
         await s.sync()
-        path, pos = await _locate(s, name, file, line)
+        path, pos = await _locate(s, name, file, line, column)
         s.open(path)
         doc = {"textDocument": {"uri": lsp.uri_of(path)}, "position": pos}
-        decls = await s.request("textDocument/definition", doc) or []
+        if isinstance(s.capabilities.get("renameProvider"), dict) and s.capabilities["renameProvider"].get("prepareProvider"):
+            prepared = await s.request("textDocument/prepareRename", doc)
+            if not prepared:
+                raise ToolError(f"The language server cannot rename what is at {path}:{pos['line'] + 1} (not a renameable symbol, or it is declared in a library).")
+            span = prepared.get("range") or (prepared if "start" in prepared else None)
+            current = prepared.get("placeholder")
+            if current is None and span and span["start"]["line"] == span["end"]["line"]:
+                text = (s.open(path).splitlines() or [""])[span["start"]["line"]] if span["start"]["line"] < len(s.open(path).splitlines()) else ""
+                current = text[lsp.py_index(text, span["start"]["character"]) : lsp.py_index(text, span["end"]["character"])]
+            if current is not None and current != name:
+                raise OutcomeError(
+                    "failed",
+                    f"The symbol the language server would rename at {path}:{pos['line'] + 1} is '{current}', not '{name}'. Nothing was changed.",
+                    category="input", reason="symbol_mismatch",
+                )
+        symbol, key, decls = await _describe(s, name, doc, cache)
         edit = await s.request("textDocument/rename", {**doc, "newName": new_name}, timeout=300)
         if not edit:
             raise ToolError(f"The language server cannot rename '{name}' at {path}:{pos['line'] + 1} (not a renameable symbol, or it is declared in a library).")
         changes = await asyncio.to_thread(lsp.plan_workspace_edit, edit)
         if not changes:
-            return f"Renaming '{name}' to '{new_name}' changes nothing."
+            return guard.outcome("not_run", f"Renaming '{name}' to '{new_name}' changes nothing.", reason="no_occurrences", category="input")
 
-        # The refactoring renames the symbol; keep the file name in step with a top-level type.
-        if isinstance(decls, dict):
-            decls = [decls]
+        # Keep the file name in step with a top-level type it is named after, as the class/file
+        # convention requires. Nothing else is ever moved.
         if rename_files:
-            for d in decls:
-                dpath = lsp.path_of(d.get("uri") or d.get("targetUri"))
-                if dpath.stem != name or dpath.suffix not in symbols.SOURCE_SUFFIXES:
-                    continue
-                target = dpath.with_name(new_name + dpath.suffix)
+            for uri, _start in map(_target, decls):
+                dpath = lsp.path_of(uri)
                 change = next((c for c in changes if path_key(c.path) == path_key(dpath)), None)
-                if change and not change.new_path and not target.exists():
-                    change.new_path = target
-
-        root_key = path_key(s.root)
-        outside = [c.path for c in changes if not path_key(c.path).startswith(root_key)]
+                if not uri.startswith("file:") or dpath.stem != name or dpath.suffix not in symbols.SOURCE_SUFFIXES or change is None or change.new_path:
+                    continue
+                declares_type = any(
+                    sym.name == name and not sym.container and sym.kind not in ("fun", "val", "var")
+                    for sym in symbols.outline(change.old_text or "", java=dpath.suffix == ".java")
+                )
+                if declares_type:
+                    change.new_path = active().check(dpath.with_name(new_name + dpath.suffix))
+        for c in changes:
+            if c.new_path and c.new_path != c.path and os.path.lexists(c.new_path) and not lsp._same_file(c.path, c.new_path):
+                raise Blocked(
+                    "destination_collision",
+                    f"Renaming '{name}' to '{new_name}' moves {rel(c.path, s.root)} to {c.new_path.name}, which already exists. "
+                    "Nothing was changed. Resolve the collision, or pass rename_files=false to leave the file name alone.",
+                    "input",
+                )
+        outside = [q for c in changes for q in (c.path, c.new_path) if q is not None and not within(q, s.root)]
         if outside:
-            raise ToolError("The rename would edit files outside the project, so nothing was changed:\n" + "\n".join(f"  {p}" for p in outside[:10]))
+            raise Blocked("target_mismatch", "The rename would edit files outside the project, so nothing was changed:\n" + "\n".join(f"  {q}" for q in outside[:10]))
+
+        digest = lsp.plan_digest(changes, identity(s.root).path, key, name, new_name)
         if not dry_run:
+            if not preview_id:
+                raise OutcomeError(
+                    "failed",
+                    "dry_run=false needs the preview_id of the edit set you reviewed. Call with dry_run=true first; nothing was written.",
+                    category="input", reason="preview_required",
+                )
+            if preview_id.strip() != digest:
+                raise Blocked(
+                    "stale_preview",
+                    f"The edit set for renaming '{name}' to '{new_name}' is no longer the one previewed as {preview_id.strip()}: a file "
+                    "changed, the language server resolves the symbol differently, or the project or session is another one. "
+                    "Nothing was written. Preview again and review the new edit set.",
+                    "input",
+                )
             await asyncio.to_thread(lsp.write_changes, changes)
             s.forget_open()
 
     total = sum(len(c.changed_lines()) for c in changes)
+    complete, reason, note = _completeness(s, True)
     verb = "Would rename" if dry_run else "Renamed"
-    out = [s.caveat() + f"{verb} '{name}' to '{new_name}': {total} line(s) in {len(changes)} file(s) under {s.root}.  [code-aware]"]
+    out = [_provenance("semantic", engine, s.root, complete, reason), symbol]
+    if note:
+        out.append(note)
+    out.append(f"{verb} '{name}' to '{new_name}': {total} line(s) in {len(changes)} file(s).")
     budget = 150
     for c in sorted(changes, key=lambda c: str(c.path)):
         lines = c.changed_lines()
         label = rel(c.path, s.root) + f" ({len(lines)})"
         if c.new_path:
             label += f"  -> {'will be ' if dry_run else ''}renamed to {c.new_path.name}"
-        out.append(label)
+        out.append(label + f"  [revision {lsp.revision(c)}]")
         for ln, text in lines[: max(budget, 0)]:
             out.append(f"  {ln:>5}  {text[:200]}")
         budget -= len(lines)
-    out.append("\nNothing was written. Call again with dry_run=false to apply." if dry_run else "\nRun compile to verify.")
+    if dry_run:
+        out.append(f"preview_id: {digest}")
+        out.append(
+            "Nothing was written. To apply exactly this edit set, call again with the same arguments, dry_run=false and "
+            "this preview_id. It is rejected as stale if any of these files, the symbol or the project has changed by then."
+        )
+        return guard.outcome("not_run", clip("\n".join(out), 50_000, keep="head"), reason="dry_run")
+    out.append(f"Applied the edit set previewed as {digest}. Run compile to verify.")
+    return guard.outcome("passed", clip("\n".join(out), 50_000, keep="head"))
+
+
+# ----------------------------------------------------------------------------- flow navigation
+
+
+def _dispatch(cache: dict[str, list[str] | None], path: Path | None, line: int) -> str:
+    """How firmly a call target is known, read off its declaration: `exact` for a final
+    declaration, `possible dispatch` when an override may run instead, `unresolved` when the
+    declaration cannot be inspected."""
+    lines = _file_lines(cache, path) if path is not None else None
+    if lines is None or line >= len(lines):
+        return "unresolved: declared outside expected_root, so overriding cannot be checked"
+    declared = symbols.outline("\n".join(lines), java=path.suffix == ".java")  # type: ignore[union-attr]
+    sym = next((d for d in declared if d.line == line + 1), None)
+    if sym is None:
+        return "unresolved: the declaration on that line was not recognised"
+    text = lines[line]
+    owner = next((d for d in declared if d.qualified == sym.container), None) if sym.container else None
+    if owner is not None and owner.kind == "interface":
+        return "possible dispatch: declared in an interface"
+    if path.suffix == ".java":  # type: ignore[union-attr]
+        virtual = sym.container and not re.search(r"\b(final|static|private)\b", text)
+        return "possible dispatch: an overridable Java method" if virtual else "exact"
+    if re.search(r"\b(abstract|open|override)\b", text) and not re.search(r"\bfinal\b", text):
+        return "possible dispatch: declared abstract, open or as an override"
+    return "exact"
+
+
+async def _call_item(s: lsp.Session, name: str, doc: dict) -> dict:
+    items = _as_list(await s.request("textDocument/prepareCallHierarchy", doc))
+    if not items:
+        raise ToolError(f"'{name}' at that position is not something the language server has a call hierarchy for (a function, constructor or property accessor).")
+    if len(items) > 1:
+        raise _ambiguous(
+            f"'{name}' at that position resolves to {len(items)} callables:\n"
+            + "\n".join(f"  {i.get('name')} {i.get('detail') or ''}  -> file={lsp.path_of(i['uri'])} line={i['selectionRange']['start']['line'] + 1}" for i in items[:30])
+        )
+    return items[0]
+
+
+def _item_row(s: lsp.Session, cache: dict[str, list[str] | None], item: dict) -> tuple[Path | None, int, str]:
+    uri, start = item.get("uri") or "", item["selectionRange"]["start"]
+    if not uri.startswith("file:"):
+        return None, start["line"], f"{uri}  {item.get('name')} {item.get('detail') or ''}".rstrip()
+    path = lsp.path_of(uri)
+    text = _line_text(cache, path, start["line"]) or f"{_SYMBOL_KINDS.get(item.get('kind'), 'symbol')} {item.get('name')} {item.get('detail') or ''}".rstrip()
+    return path, start["line"], f"{rel(path, s.root)}:{start['line'] + 1}  {text}"
+
+
+@ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=READ)
+async def find_implementations(
+    ctx: Context,
+    name: Annotated[str, Field(description="Identifier of the interface, class or member to find implementations of.")],
+    root: SearchRoot = None,
+    file: AtFile = None,
+    line: AtLine = None,
+    column: AtColumn = None,
+    limit: Limit = 100,
+    offset: Offset = 0,
+    expected_root: ExpectedRoot = None,
+) -> str:
+    """List the implementations of an interface or abstract class, or the overrides of a member,
+    as the language server resolves them (Go to Implementation in the IDE). Semantic only: when
+    the language server is missing, not ready or does not offer the request, this is an error
+    and nothing is inferred from text. The first line states engine, project and completeness;
+    a truncated listing continues with `offset`."""
+    s = await _semantic(ctx, root, file, "Implementations are not inferred from text.", "textDocument/implementation")
+    cache: dict[str, list[str] | None] = {}
+    async with s.lock:
+        await s.sync()
+        path, pos = await _locate(s, name, file, line, column)
+        s.open(path)
+        doc = {"textDocument": {"uri": lsp.uri_of(path)}, "position": pos}
+        symbol, _key, _decls = await _describe(s, name, doc, cache)
+        found = _as_list(await s.request("textDocument/implementation", doc))
+    rows = []
+    for uri, start in sorted({(u, (st["line"], st["character"])) for u, st in map(_target, found)}):
+        if uri.startswith("file:"):
+            p = lsp.path_of(uri)
+            rows.append(f"{rel(p, s.root)}:{start[0] + 1}  {_line_text(cache, p, start[0])}".rstrip())
+        else:
+            rows.append(uri)
+    listed, reached_end, more = _page(rows, offset, limit)
+    complete, reason, note = _completeness(s, reached_end)
+    out = [_provenance("semantic", "semantic", s.root, complete, reason), symbol]
+    if note:
+        out.append(note)
+    out.append(f"{len(rows)} implementation(s) of '{name}' found by the language server." if rows else f"No implementations of '{name}' found by the language server.")
+    out.extend("  " + r for r in listed)
+    if more:
+        out.append(more)
     return clip("\n".join(out), 50_000, keep="head")
+
+
+async def _calls(ctx: Context, direction: str, name: str, root: str | None, file: str | None, line: int | None, column: int | None, limit: int, offset: int) -> str:
+    method = "callHierarchy/incomingCalls" if direction == "caller" else "callHierarchy/outgoingCalls"
+    s = await _semantic(ctx, root, file, "Calls are not inferred from text.", "textDocument/prepareCallHierarchy", method)
+    cache: dict[str, list[str] | None] = {}
+    async with s.lock:
+        await s.sync()
+        path, pos = await _locate(s, name, file, line, column)
+        s.open(path)
+        doc = {"textDocument": {"uri": lsp.uri_of(path)}, "position": pos}
+        symbol, _key, _decls = await _describe(s, name, doc, cache)
+        item = await _call_item(s, name, doc)
+        calls = [c for c in await s.request(method, {"item": item}) or [] if isinstance(c, dict)]
+    site_path = None if direction == "caller" else lsp.path_of(item["uri"])  # callee call sites are in the selected symbol's file
+    entries = []
+    for call in calls:
+        other = call.get("from" if direction == "caller" else "to") or {}
+        target_path, target_line, row = _item_row(s, cache, other)
+        where = site_path or target_path
+        sites = [
+            f"      call at {rel(where, s.root) if where else other.get('uri')}:{r['start']['line'] + 1}:{r['start']['character'] + 1}"
+            for r in call.get("fromRanges") or []
+        ]
+        if direction == "callee":
+            row += f"  [{_dispatch(cache, target_path, target_line)}]"
+        entries.append((row, sites))
+    entries.sort(key=lambda e: e[0])
+    listed, reached_end, more = _page(entries, offset, limit)
+    complete, reason, note = _completeness(s, reached_end)
+    out = [_provenance("semantic", "semantic", s.root, complete, reason), symbol]
+    if note:
+        out.append(note)
+    out.append(f"{len(entries)} direct {direction}(s) of '{name}' found by the language server." if entries else f"No direct {direction}s of '{name}' found by the language server.")
+    for row, sites in listed:
+        out.append("  " + row)
+        out.extend(sites[:20])
+        if len(sites) > 20:
+            out.append(f"      [... {len(sites) - 20} more call sites ...]")
+    if more:
+        out.append(more)
+    if direction == "callee" and any("possible dispatch" in row for row, _ in listed):
+        out.append("A 'possible dispatch' target is the declaration the call resolves to statically; an override may run instead. find_implementations on that declaration lists the candidates.")
+    out.append(_STATIC_NOTE)
+    return clip("\n".join(out), 50_000, keep="head")
+
+
+@ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=READ)
+async def find_callers(
+    ctx: Context,
+    name: Annotated[str, Field(description="Identifier of the function, constructor or property whose callers to list.")],
+    root: SearchRoot = None,
+    file: AtFile = None,
+    line: AtLine = None,
+    column: AtColumn = None,
+    limit: Limit = 100,
+    offset: Offset = 0,
+    expected_root: ExpectedRoot = None,
+) -> str:
+    """List the direct callers of one function: each calling declaration with its call sites, as
+    the language server's call hierarchy resolves them. One level only; a function that calls
+    itself is listed as its own caller, and chains are not followed. Overloads are separate
+    symbols, selected by `file`, `line` and `column`. Semantic only: an error, never a text
+    search, when the language server is missing, not ready or has no call hierarchy. Static
+    relationships, not a runtime order."""
+    return await _calls(ctx, "caller", name, root, file, line, column, limit, offset)
+
+
+@ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=READ)
+async def find_callees(
+    ctx: Context,
+    name: Annotated[str, Field(description="Identifier of the function, constructor or property whose outgoing calls to list.")],
+    root: SearchRoot = None,
+    file: AtFile = None,
+    line: AtLine = None,
+    column: AtColumn = None,
+    limit: Limit = 100,
+    offset: Offset = 0,
+    expected_root: ExpectedRoot = None,
+) -> str:
+    """List what one function calls directly: each target declaration with the call sites inside
+    the function, as the language server's call hierarchy resolves them. Each target is marked
+    `exact` (a final declaration), `possible dispatch` (an interface, abstract, open or
+    overriding member, so an override may run instead; see find_implementations) or
+    `unresolved` (declared outside expected_root, such as a library). One level only; chains are
+    not followed. Semantic only: an error, never a text search, when the language server is
+    missing, not ready or has no call hierarchy. Static relationships, not a runtime order."""
+    return await _calls(ctx, "callee", name, root, file, line, column, limit, offset)
 
 
 def _hover_text(hover: dict | None) -> str:
@@ -1131,21 +1558,20 @@ def _hover_text(hover: dict | None) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-@mcp.tool(annotations=READ)
+@ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=READ)
 async def symbol_info(
     ctx: Context,
     file: Annotated[str, Field(description="Absolute path of the file where the symbol appears.")],
     line: Annotated[int, Field(description="1-based line where it appears.", ge=1)],
     name: Annotated[str | None, Field(description="The identifier on that line. Give this or `column`.")] = None,
     column: Annotated[int | None, Field(description="1-based column, when the identifier occurs more than once on the line.", ge=1)] = None,
+    expected_root: ExpectedRoot = None,
 ) -> str:
     """Resolve the symbol at a position, like hovering it in the IDE: its full signature with
     inferred types, its documentation, and where it is declared (project file and line, or the
     library it comes from). Works for library and JDK symbols as well as project code. Requires
     the Kotlin language server."""
-    if lsp.find_server() is None:
-        raise ToolError(lsp.NOT_INSTALLED + " Without it, use find_symbol for a text-based lookup by name.")
-    s = await _session(ctx, _workspace_root(None, file))
+    s = await _semantic(ctx, None, file, "Without it, use find_symbol for a text-based lookup by name.", "textDocument/hover")
     async with s.lock:
         await s.sync()
         path, pos = await _locate(s, name, file, line, column)
@@ -1169,24 +1595,23 @@ async def symbol_info(
     return clip("\n".join(out), 20_000, keep="head")
 
 
-@mcp.tool(annotations=READ)
+@ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=READ)
 async def file_problems(
     ctx: Context,
     file: Annotated[str, Field(description="Absolute path of a .kt, .kts or .java file.")],
     min_severity: Annotated[
         Literal["error", "warning", "info", "hint"], Field(description="Least severe level to report.")
     ] = "warning",
+    expected_root: ExpectedRoot = None,
 ) -> str:
     """Analyse one file with IntelliJ's inspections, like the problems the IDE highlights:
     compiler errors plus inspection warnings (unused code, simplifiable expressions, deprecated
     API, ...), each with the quick fixes the IDE would offer. It needs no build and reflects the
     file as it is on disk. Requires the Kotlin language server; `compile` and `detekt` are the
     alternatives without it."""
-    if lsp.find_server() is None:
-        raise ToolError(lsp.NOT_INSTALLED + " Without it, use compile(file=...) for compiler errors and detekt for static analysis.")
     path = _source(file)
     assert path is not None
-    s = await _session(ctx, _workspace_root(None, file))
+    s = await _semantic(ctx, None, file, "Without it, use compile(file=...) for compiler errors and detekt for static analysis.", "textDocument/diagnostic")
     _require_imported(s, path)
     async with s.lock:
         await s.sync()
@@ -1222,11 +1647,42 @@ async def file_problems(
     return clip("\n".join(result), 40_000, keep="head")
 
 
+# ----------------------------------------------------------------------------- readiness
+
+
+@ops.tool(kind="readiness", needs=(), annotations=READ, structured_output=True)
+async def readiness(expected_root: ExpectedRoot = None, project_dir: ProjectDir = None) -> Readiness:
+    """Report what this server could do for a scope right now, without doing it: the validated
+    scope, the Gradle project found in it, whether Gradle can be started (`execution`) and
+    whether code-aware analysis can be answered (`semantic`), each with a reason code when it
+    is not, plus the registered operations and the checks each enforces.
+
+    Nothing is run, imported, indexed, scanned or written to find this out, so a state that
+    could only be established by doing the work is `unknown`: an installed wrapper, JDK or
+    language server is not evidence that it works. This is a current observation, not an
+    authorisation: every operation checks its own prerequisites again when it runs, and a
+    readiness response says nothing about whether a build or test passed. There is no overall
+    flag; read `execution` and `semantic` separately."""
+    scope = active()
+    try:
+        project: GradleProject | None = _project(project_dir, search_below=False)
+    except Blocked:
+        raise
+    except ToolError as e:
+        project, why = None, str(e).splitlines()[0]
+    if project is None:
+        execution: tuple[str, str | None, str | None] = ("unavailable", "project_not_found", why)
+    else:
+        execution = gradle.execution_state(project)
+    return ops.report(scope, project.root if project else None, execution, lsp.semantic_state(project.root if project else scope.root))
+
+
 # ----------------------------------------------------------------------------- entry point
 
 
 def check() -> int:
     """Self-test for install scripts: show what the server sees."""
+    ops.verify()
     tools = asyncio.run(mcp.list_tools())
     print(f"server:  kotlin ({len(tools)} tools)")
     print(f"cwd:     {Path.cwd()}")
@@ -1236,7 +1692,7 @@ def check() -> int:
     print(f"android: {sdk or 'no SDK found (fine for JVM projects, or when local.properties sets sdk.dir)'}")
     print(f"detekt:  {_find_cli('DETEKT_CLI', 'detekt', 'detekt-cli') or 'no CLI (Gradle detekt tasks are used when present)'}")
     print(f"ktlint:  {_find_cli('KTLINT_CLI', 'ktlint') or 'no CLI (Gradle ktlint/spotless tasks are used when present)'}")
-    print(f"lsp:     {lsp.find_server() or 'not installed (run: kotlin-mcp --install-lsp) - find_usages/rename_symbol fall back to text matching'}")
+    print(f"lsp:     {lsp.find_server() or 'not installed (run: kotlin-mcp --install-lsp) - code-aware tools are blocked; engine=\'text\' is the explicit alternative'}")
     try:
         project = gradle.find_project(None)
         print(f"gradle:  build at {project.root} via {' '.join(project.launcher)}")
@@ -1256,6 +1712,7 @@ def main() -> None:
         except ToolError as e:
             sys.exit(f"FAILED: {e}")
         return
+    ops.verify()
     mcp.run()
 
 

@@ -1,8 +1,9 @@
 # ide-mcp
 
 Two MCP servers that give coding agents (Codex, Claude Code, ...) what the JetBrains MCP server
-offers, without an IDE: nothing has to be opened in Android Studio or IntelliJ first, and no
-tool is scoped to a workspace. Every tool takes a path and works out the rest.
+offers, without an IDE: nothing has to be opened in Android Studio or IntelliJ first. Every
+tool takes the directory the request is for (`expected_root`) and a path, and refuses to use
+anything that resolves outside that directory or belongs to a different Git worktree.
 
 | Server | Binary | What it does |
 | --- | --- | --- |
@@ -62,6 +63,9 @@ agent starts a server.
 
 ## How paths work
 
+- **Every tool** takes `expected_root` (see [Request scope](#request-scope-outcomes-and-readiness)).
+  Relative paths and omitted directories resolve against it, never against the directory the
+  server was started in.
 - **File tools** take absolute paths (or `~/...`). Search and listing tools take a `root`
   directory. Inside a git repository they honour `.gitignore`; elsewhere they skip build and
   cache directories. `include_ignored=true` looks everywhere.
@@ -72,6 +76,222 @@ agent starts a server.
 - **Modules** are Gradle paths (`:app`, `:features:login`). Most tools also accept `file`
   instead and use the module that owns it.
 
+## Request scope, outcomes and readiness
+
+Request contract **2.0** (package 0.2.0). Earlier callers must add `expected_root` to every
+call; there is no unscoped route.
+
+### `expected_root`
+
+The absolute path of the directory the caller selected for the request:
+
+| Request | What to pass |
+| --- | --- |
+| Anything in a Git checkout | The worktree root, or a directory inside it. For Gradle and code-aware tools it must be at or above the Gradle root (`<repo>` or `<repo>\android`). |
+| A project that is not in Git | The project root itself. |
+| Standalone files (notes, tickets, saved logs) | The folder that holds them. No repository is needed. |
+
+What the servers then enforce, inside each operation and at the point of access:
+
+- Every path is resolved (links, junctions, `..`, 8.3 names, case, `\\?\` prefixes) and compared
+  with the scope component by component. `C:\dev\app-other` is not inside `C:\dev\app`.
+- The target must belong to the same Git worktree as the scope. A worktree is identified by
+  the directory that holds its `.git` entry, not by repository name, branch, commit or the
+  shared `.git` directory, so two worktrees at one commit never stand in for each other, and a
+  shared parent such as `C:\dev` selects neither.
+- The Gradle project that discovery actually returns, the directory the language-server
+  session was actually started in, and the working directory of every process are checked
+  again immediately before use. Gradle options that redirect a build (`-p`, `--project-dir`,
+  `-c`, `--settings-file`, `-b`, `--build-file`, `--include-build`, `-I`, `--init-script`) are
+  accepted only when they point inside the scope. `run_command` rejects a command line that
+  names a path in another worktree.
+- A file is opened, and the open handle is compared with the validated path before a byte is
+  read; a new file is written through a temporary file whose location is confirmed first.
+- `*.properties` files are never read, searched, parsed, edited, moved or returned, under any
+  spelling (`LOCAL.PROPERTIES`, `local.properties.`, `local.properties::$DATA`, a link, an 8.3
+  name). `project_info` therefore no longer reports the Gradle version.
+
+`expected_root` restricts a request. It grants nothing: `IDE_MCP_ALLOWED_ROOTS` and the
+client's own approvals still apply. The server cannot know whether the scope a caller passes is
+the one the user meant; binding it to the user's task is the client's job. Advertised MCP roots
+and tool annotations are not used as authorisation.
+
+Limits worth knowing: a hard link to a protected file under another name cannot be told apart
+from an ordinary file; `run_command` runs a real shell, so beyond its working directory and the
+paths spelled out in the command it is not confined; on platforms without handle-relative file
+APIs a swapped directory is detected after the open or the temporary-file creation rather than
+prevented, so an empty temporary file can exist for an instant in the wrong place before it is
+removed, though the payload is never written there.
+
+### Outcomes and errors
+
+Failures are MCP tool errors (`isError: true`) whose text starts with one parseable line:
+
+```
+[outcome=blocked reason=target_mismatch category=policy] C:\dev\app-other\README.md resolves to ...
+```
+
+| Outcome | Meaning |
+| --- | --- |
+| `passed` | First line of a successful build, test, lint, command or applied rename. |
+| `failed` | It ran and failed, or the request was wrong. `category` says which: `source` (compiler errors, failing tests, lint findings), `input`, `environment`, `policy`, or `unknown` when a build failed without located errors. |
+| `blocked` | Stopped by a check before anything was read, written or run. |
+| `timed_out` | Killed after `timeout_sec`. |
+| `not_run` | Nothing was executed: a rename preview (`reason=dry_run`, a normal result), or a test run in which no test executed (`reason=no_tests_executed`, an error). |
+| `cancelled` | Not a result: a cancelled request is ended by the protocol and its process tree is killed. |
+
+Reason codes: `missing_scope`, `invalid_scope`, `scope_too_broad`, `permission_denied`,
+`target_mismatch`, `target_changed`, `protected_path`, `unsupported_path`, `argument_redirect`,
+`execution_unavailable`, `semantic_not_installed`, `semantic_unavailable`, `semantic_indexing`,
+`semantic_readiness_unknown`, `semantic_import_failed`, `semantic_session_mismatch`,
+`semantic_request_failed`, `unsupported_operation`, `ambiguous_symbol`, `symbol_mismatch`,
+`text_rename_rejected`, `preview_required`, `stale_preview`, `destination_collision`,
+`apply_failed`, `unguarded_access`, `undeclared_prerequisite`.
+
+### `readiness`
+
+Both servers have a `readiness(expected_root, ...)` tool with an output schema. It reports
+what is known without doing anything: no Gradle run, no language-server start, no import, no
+directory scan, no write.
+
+```json
+{
+  "schema_version": "1.0",
+  "contract_version": "2.0",
+  "server": "kotlin",
+  "server_version": "0.2.0",
+  "resolved_scope": "C:\\dev\\app",
+  "worktree_root": "C:\\dev\\app",
+  "project_root": "C:\\dev\\app\\android",
+  "execution": {"state": "unknown", "reason": "execution_not_observed", "detail": "A Gradle launcher and a JDK are present, but this server has not run Gradle for this project yet; ..."},
+  "semantic": {"state": "unknown", "reason": "semantic_not_started", "detail": "No language server session is running for this project. ..."},
+  "operations": [{"name": "compile", "kind": "execution", "requires": ["scope", "target_access", "verified_project", "execution"]}]
+}
+```
+
+- `execution.state`: `available` (this server process has started Gradle, or the shell, here),
+  `unavailable`, `unknown` (the launcher and JDK exist, which is not evidence that they work),
+  `not_applicable`.
+- `semantic.state`: `ready`, `indexing`, `unavailable`, `unknown` (no session yet, or one that
+  never reported a finished import), `not_applicable` (the files server).
+- There is no overall flag. A response shows that the query reached the server, nothing more:
+  it is not an authorisation, each operation checks its prerequisites again when it runs, and
+  it says nothing about whether a build or test passed.
+- `operations` is generated from the tool registrations, which is also where each tool's
+  checks come from. `serverInfo.version` in the MCP handshake carries the package version; the
+  tool list is fixed for the life of a server process, so `listChanged` is not advertised and
+  clients pick up a new contract when they reconnect and list tools.
+
+### Examples
+
+A valid read, and the same read with the wrong worktree selected:
+
+```json
+{"name": "read_file", "arguments": {"expected_root": "C:\\dev\\app", "path": "C:\\dev\\app\\README.md"}}
+{"name": "read_file", "arguments": {"expected_root": "C:\\dev\\app", "path": "C:\\dev\\app-other\\README.md"}}
+```
+
+```
+[outcome=blocked reason=target_mismatch category=policy] C:\dev\app-other\README.md resolves to
+C:\dev\app-other\README.md, which is outside expected_root C:\dev\app. Nothing was read, written or run. ...
+```
+
+A saved Gradle log is read by naming its folder as the scope:
+`{"expected_root": "C:\\Users\\you\\.cache\\ide-mcp\\logs", "path": "app-20261120-101500-4242.log"}`.
+
+Readiness, then a code-aware query:
+
+```json
+{"name": "readiness", "arguments": {"expected_root": "C:\\dev\\app"}}
+{"name": "find_usages", "arguments": {"expected_root": "C:\\dev\\app", "name": "Door", "file": "C:\\dev\\app\\src\\main\\kotlin\\demo\\Door.kt", "line": 3, "engine": "semantic"}}
+```
+
+```
+[engine=semantic requested=semantic project=C:\dev\app complete=true]
+symbol: Door, declared at src/main/kotlin/demo/Door.kt:3
+  class Door(val width: Int)
+'Door': 4 usage(s), 1 declaration(s), 0 import(s) on 5 listed line(s).  [D = declaration]
+src/main/kotlin/demo/Door.kt
+      3 D class Door(val width: Int)
+      5   fun open(d: Door): Door = d
+...
+```
+
+An ambiguous selection is rejected with the candidates:
+
+```
+[outcome=failed reason=ambiguous_symbol category=input]
+'Door' occurs 2 times on line 5 of C:\dev\app\src\main\kotlin\demo\Use.kt. Call again with one of: column=12, column=23
+```
+
+Labelled text search (`engine="text"`, or `engine="auto"` when the language server is not
+available): the first line reads `[engine=text requested=auto project=... complete=false
+incomplete_reason=text_match]`, followed by the reason semantic resolution was not used.
+
+Rename is two calls. The preview writes nothing:
+
+```json
+{"name": "rename_symbol", "arguments": {"expected_root": "C:\\dev\\app", "name": "Door", "new_name": "Gate", "file": "C:\\dev\\app\\src\\main\\kotlin\\demo\\Door.kt", "line": 3}}
+```
+
+```
+[outcome=not_run reason=dry_run]
+[engine=semantic requested=semantic project=C:\dev\app complete=true]
+symbol: Door, declared at src/main/kotlin/demo/Door.kt:3
+  class Door(val width: Int)
+Would rename 'Door' to 'Gate': 5 line(s) in 2 file(s).
+src/main/kotlin/demo/Door.kt (2)  -> will be renamed to Gate.kt  [revision 540a40e158e9]
+      3  class Gate(val width: Int)
+      5  fun open(d: Gate): Gate = d
+src/main/kotlin/demo/Use.kt (3)  [revision 1dff929d0937]
+      5  val pair = Gate(1) to Gate(2)
+...
+preview_id: 1989c1bb2affc8b4
+```
+
+Applying repeats the arguments with `"dry_run": false, "preview_id": "1989c1bb2affc8b4"`. The
+edit set is computed again and applied only if it is byte-for-byte the one previewed; after an
+edit to `Use.kt` in between:
+
+```
+[outcome=blocked reason=stale_preview category=input] The edit set for renaming 'Door' to 'Gate' is no
+longer the one previewed as 1989c1bb2affc8b4: ... Nothing was written. Preview again and review the new edit set.
+```
+
+Direct navigation queries, one level each:
+
+```json
+{"name": "find_implementations", "arguments": {"expected_root": "C:\\dev\\app", "name": "area", "file": "C:\\dev\\app\\src\\main\\kotlin\\demo\\Shapes.kt", "line": 4}}
+{"name": "find_callers", "arguments": {"expected_root": "C:\\dev\\app", "name": "total", "file": "C:\\dev\\app\\src\\main\\kotlin\\demo\\Shapes.kt", "line": 16, "column": 5}}
+{"name": "find_callees", "arguments": {"expected_root": "C:\\dev\\app", "name": "total", "file": "C:\\dev\\app\\src\\main\\kotlin\\demo\\Shapes.kt", "line": 16, "column": 5}}
+```
+
+```
+2 direct callee(s) of 'total' found by the language server.
+  src/main/kotlin/demo/Shapes.kt:16  fun total(s: Shape, depth: Int): Int = ...  [exact]
+      call at src/main/kotlin/demo/Shapes.kt:16:81
+  src/main/kotlin/demo/Shapes.kt:4  fun area(): Int  [possible dispatch: declared in an interface]
+      call at src/main/kotlin/demo/Shapes.kt:16:58
+```
+
+These are static relationships, not a runtime order, and chains are not followed: walking a
+call chain means calling the query again on a result, which is left to the client.
+
+### What clients need to change
+
+1. Pass `expected_root` on every call to both servers, and pass the worktree, not a parent.
+2. Treat `isError` results as failures and read the `[outcome=... reason=...]` line. A failed
+   build, failing tests, lint findings and a non-zero `run_command` exit are now tool errors.
+3. `find_usages` and the other code-aware tools no longer answer silently from text. Read the
+   `[engine=...]` line; `engine="auto"` on `find_usages` is the only labelled text fallback.
+4. `rename_symbol`: `engine="text"` is rejected and `file_glob` is gone; `dry_run=false` needs
+   the `preview_id` from a preview.
+5. Reconnect and list tools after an upgrade. `readiness` is optional and changes from moment
+   to moment; do not cache it as a permission.
+
+Binding the scope to the user's task, caching and any routing between tools remain client
+work and are not part of these servers.
+
 ## Tools
 
 ### files
@@ -79,7 +299,7 @@ agent starts a server.
 `read_file`, `list_directory_tree`, `find_files` (glob and/or name substring),
 `search_in_files` (text or regex, with context lines), `create_file`, `replace_text` (exact or
 regex; must match once unless `replace_all`), `move_path`, `delete_path`, `git_status`,
-`run_command`.
+`run_command`, `readiness`.
 
 ### kotlin
 
@@ -95,9 +315,13 @@ regex; must match once unless `replace_all`), `move_path`, `delete_path`, `git_s
 | `dependencies` | Resolved libraries and project dependencies of a module; filter or tree |
 | `find_symbol` | Where a class, function or property is declared, with signature and KDoc (text-based) |
 | `file_outline` | Declarations in a file with line numbers (text-based) |
-| `find_usages` | References to one symbol, labelled declaration / usage / import. Code-aware with the language server |
-| `rename_symbol` | The IDE's rename refactoring; dry run by default; renames `Name.kt` too. Code-aware with the language server |
+| `find_usages` | References to one symbol, labelled declaration / usage / import, with the engine actually used and completeness. Code-aware; `engine="auto"` or `"text"` can return labelled text matches |
+| `rename_symbol` | The IDE's rename refactoring, never a text replacement. Preview by default; applying needs the preview's `preview_id`; renames `Name.kt` too |
+| `find_implementations` | Implementations of an interface or abstract class, or overrides of a member. Needs the language server |
+| `find_callers` | Direct callers of one function, with call sites. Needs the language server |
+| `find_callees` | Direct callees of one function, each marked exact, possible dispatch or unresolved. Needs the language server |
 | `symbol_info` | What the symbol at a position resolves to: signature, docs, where it is declared. Needs the language server |
+| `readiness` | Validated scope, Gradle project, execution and semantic state, registered operations. Runs nothing |
 | `file_problems` | IntelliJ inspections and compiler errors for one file, with available quick fixes, no build. Needs the language server |
 
 Gradle output is reduced to what matters: outcome, failed tasks, located errors, test results
@@ -143,10 +367,15 @@ How it behaves:
 - It uses up to 2 GB of heap per project by default. Set `IJ_JAVA_OPTIONS=-Xmx4g` for the
   `kotlin` server to change that.
 - Files edited on disk between calls are picked up automatically.
-- When a name is declared more than once, the tool lists the candidates and asks for the `file`
-  and `line` of the one you mean.
-- Without the language server, or with `engine="text"`, `find_usages` and `rename_symbol` use
-  whole-word text matching and say so in their output.
+- When a name is declared more than once, or occurs more than once on the given line, the tool
+  rejects the call with the candidates and asks for the `file`, `line` and `column` of the one
+  you mean. It never picks the first.
+- Without the language server, `find_usages` with `engine="auto"` (the default) or
+  `engine="text"` returns whole-word text matches, labelled as such on the first line.
+  `rename_symbol`, `find_implementations`, `find_callers` and `find_callees` are blocked with
+  the reason; none of them uses text.
+- The language server offers no way to choose an Android build variant, so results describe
+  whatever it imported.
 
 ### Android projects
 
@@ -168,10 +397,9 @@ files in them. Unit tests under `src/test` stay visible unless they too break th
 `compile` after a rename to catch anything missed in instrumented tests. Set
 `KOTLIN_LSP_ANDROID_WORKAROUND=0` to switch the workaround off.
 
-If an import still fails, the tools never answer from an incomplete model: `find_usages` falls
-back to text matching with a note, `rename_symbol` shows the text-based preview and writes
-nothing unless you ask for `engine="text"`, and `symbol_info` and `file_problems` return the
-reason. `compile`, `detekt` and `ktlint` are unaffected either way.
+If an import still fails, the tools never answer from an incomplete model: `find_usages` with
+`engine="auto"` returns labelled text matches with the reason, and `rename_symbol`, the
+navigation queries, `symbol_info` and `file_problems` are blocked with the reason. `compile`, `detekt` and `ktlint` are unaffected either way.
 
 ## Compared with the JetBrains MCP server
 
@@ -192,8 +420,8 @@ Where this differs from the IDE:
 
 - **Inspections and refactoring need the language server.** With it, `file_problems`,
   `find_usages` and `rename_symbol` use the same engine as the IDE. Without it, problems come
-  from the compiler and detekt only, and usages and renames are whole-word text matches that
-  cannot tell apart two symbols with the same name.
+  from the compiler and detekt only, usages are labelled whole-word text matches that cannot
+  tell apart two symbols with the same name, and renaming is not available.
 - **Android instrumented tests may be left out.** Where the language server's Android import
   needs the workaround above, `src/androidTest` is not covered by the code-aware tools.
 - **The language server covers Kotlin best.** Java files are analysed too, but its documented
