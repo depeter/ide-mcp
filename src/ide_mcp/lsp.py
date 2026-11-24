@@ -26,7 +26,21 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
-from .common import WINDOWS, Blocked, Identity, OutcomeError, ToolError, _terminate, active, identity, iter_files, path_key
+from .common import (
+    _PENDING_SECRET,
+    WINDOWS,
+    Blocked,
+    Identity,
+    OutcomeError,
+    ToolError,
+    _terminate,
+    active,
+    clip,
+    identity,
+    iter_files,
+    path_key,
+    sanitise,
+)
 from .guard import SEMANTIC
 
 DEFAULT_VERSION = "271.2085.0"
@@ -588,12 +602,19 @@ class Session:
     _open: dict[str, tuple[int, str]] = field(default_factory=dict)  # uri -> (version, text)
     _mtimes: dict[str, float] | None = None
     _reader: asyncio.Task | None = None
+    _stderr_reader: asyncio.Task[None] | None = None
+    stderr_log: str = ""
 
     # ---- transport
 
     def _send(self, message: dict) -> None:
-        if self.proc.returncode is not None or self.proc.stdin is None:
-            raise LspError("The Kotlin language server has exited; the next call starts a new one.")
+        if self.proc.returncode is not None:
+            raise LspError(
+                f"The Kotlin language server has exited (exit code {self.proc.returncode}); the next call starts a new one."
+                + self._log_hint(), "semantic_backend_exited",
+            )
+        if self.proc.stdin is None or (self._reader is not None and self._reader.done()):
+            raise LspError("The Kotlin language server's connection is closed." + self._log_hint(), "semantic_transport_closed")
         body = json.dumps(message).encode("utf-8")
         self.proc.stdin.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
 
@@ -635,7 +656,9 @@ class Session:
     def state(self, ident: Identity | None) -> tuple[str, str | None, str | None]:
         """Readiness of this session for the project `ident`, from what it has already reported."""
         if not self.alive:
-            return "unavailable", "semantic_backend_exited", "The Kotlin language server process has exited."
+            return "unavailable", "semantic_backend_exited", f"The Kotlin language server process has exited (exit code {self.proc.returncode})." + self._log_hint()
+        if self._reader is not None and self._reader.done():
+            return "unavailable", "semantic_transport_closed", "The Kotlin language server's response stream is closed." + self._log_hint()
         if self.ident is None or ident is None or self.ident != ident:
             return "unavailable", "semantic_session_mismatch", f"The running session is bound to {self.root}, not to this project."
         if self.import_status == "SCOPE_UNVERIFIED":
@@ -663,21 +686,72 @@ class Session:
         rid = self._next_id
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
-        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
         try:
+            self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
             result = await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
-            self._pending.pop(rid, None)
             try:
                 self.notify("$/cancelRequest", {"id": rid})
             except LspError:
                 pass
             raise LspError(f"The Kotlin language server did not answer {method} within {timeout:.0f}s.") from None
+        finally:
+            self._pending.pop(rid, None)
         if method not in _LIFECYCLE:
             self.verify(method)
             if generation != self.import_generation:
                 raise LspError("The backend import changed during the request. Query again.", "semantic_import_changed", "input")
         return result
+
+    async def _read_stderr(self) -> None:
+        """Drain stderr without writing raw diagnostics or retaining unbounded output."""
+        stream = self.proc.stderr
+        assert stream is not None
+        raw = bytearray()
+        oversized = False
+        try:
+            while chunk := await stream.read(8192):
+                if len(raw) + len(chunk) > 65_536:
+                    oversized = True
+                    raw.clear()
+                if not oversized:
+                    raw.extend(chunk)
+        except OSError:
+            self.stderr_log = "[stderr unavailable: stream read failed]"
+            return
+        if oversized:
+            # dover-gain-efficient: withhold oversized diagnostics rather than retain an unsafe raw tail.
+            self.stderr_log = "[stderr withheld: capture limit exceeded]"
+            return
+        lines = []
+        in_key = pending_secret = False
+        for line in raw.decode("utf-8", "replace").splitlines(keepends=True):
+            next_secret = bool(_PENDING_SECRET.search(line))
+            if pending_secret:
+                line = "[credential continuation withheld]\n"
+            pending_secret = next_secret
+            if "-----BEGIN " in line and "PRIVATE KEY-----" in line:
+                in_key = True
+            if in_key:
+                ending = "-----END " in line and "PRIVATE KEY-----" in line
+                line = "[private key withheld]\n"
+                in_key = not ending
+            lines.append(line)
+        self.stderr_log = clip(sanitise("".join(lines)), 8000, keep="tail")
+
+    async def _transport_error(self) -> LspError:
+        """Allow process-exit and stderr delivery to settle before describing an EOF."""
+        if self.proc.returncode is None:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.proc.wait(), 1)
+        if self.proc.returncode is not None and self._stderr_reader:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(self._stderr_reader), 1)
+        if self.proc.returncode is None:
+            return LspError("The Kotlin language server's response stream closed. Process termination is unconfirmed."
+                            + self._log_hint(), "semantic_transport_closed")
+        return LspError(f"The Kotlin language server exited unexpectedly (exit code {self.proc.returncode})."
+                        + self._log_hint(), "semantic_backend_exited")
 
     async def _read_loop(self) -> None:
         out = self.proc.stdout
@@ -697,12 +771,13 @@ class Session:
                 if not length:
                     continue
                 self._handle(json.loads(await out.readexactly(length)))
-        except (asyncio.IncompleteReadError, ConnectionError, json.JSONDecodeError):
+        except (asyncio.IncompleteReadError, ConnectionError, ValueError):
             return
         finally:
+            error = await self._transport_error() if self._pending else None
             for fut in self._pending.values():
                 if not fut.done():
-                    fut.set_exception(LspError("The Kotlin language server exited unexpectedly."))
+                    fut.set_exception(error or LspError("The Kotlin language server's response stream closed.", "semantic_transport_closed"))
             self._pending.clear()
             self.import_done.set()
 
@@ -870,10 +945,11 @@ class Session:
         return any(now - begun > 1.0 for begun in self._begun.values())
 
     def _log_hint(self) -> str:
+        stderr = f"\nLauncher stderr:\n{self.stderr_log}" if self.stderr_log else ""
         if self.import_error:
-            return f"\nGradle said: {self.import_error}"
+            return f"\nGradle said: {self.import_error}" + stderr
         tail = "\n".join(self.import_log[-6:])
-        return f"\nImport log:\n{tail}" if tail else ""
+        return (f"\nImport log:\n{tail}" if tail else "") + stderr
 
     def unreliable(self) -> str:
         """Why code-aware results for this project cannot be trusted, or '' when they can.
@@ -943,6 +1019,12 @@ class Session:
             await _terminate(self.proc)
         if self._reader:
             self._reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reader
+        if self._stderr_reader:
+            self._stderr_reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._stderr_reader
 
     # ---- keeping the server's view of files current
 
@@ -1046,6 +1128,8 @@ async def _discard(key: str, s: Session, *, quietly: bool) -> None:
             await _terminate(s.proc)
         if s._reader:
             s._reader.cancel()
+        if s._stderr_reader:
+            s._stderr_reader.cancel()
     else:
         await s.stop()
 
@@ -1069,6 +1153,9 @@ async def session_for(root: Path, timeout: float = 600.0, on_status: Callable[[s
     while True:
         async with _start_locks.setdefault(key, asyncio.Lock()):
             s = _sessions.get(key)
+            if s is not None and s._reader is not None and s._reader.done():
+                await _discard(key, s, quietly=True)
+                s = None
             if s is not None and s.alive and s.ident != bound:
                 await _discard(key, s, quietly=True)
                 s = None
@@ -1143,12 +1230,14 @@ async def _start(root: Path, launcher: Path, system: Path, *, variant: str | Non
             env=env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
             limit=16 * 1024 * 1024,
             **kwargs,
         )
     except OSError as e:
         raise LspError(f"Could not start the Kotlin language server at {launcher}: {e}") from None
+    if getattr(s.proc, "stderr", None) is not None:
+        s._stderr_reader = asyncio.create_task(s._read_stderr())
     return s
 
 
