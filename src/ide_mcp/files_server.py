@@ -54,6 +54,9 @@ mcp = FastMCP(
         "Windows both C:\\dir\\file and C:/dir/file work. Relative paths and omitted directories "
         "resolve against expected_root, never the server's start directory. *.properties files are "
         "never read, searched or edited.\n"
+        "File reads, searches and edit previews return content without credential or payment "
+        "redaction. Scope, protected-file and output-size checks still apply. Command and "
+        "validation output remains sanitised.\n"
         "Rejections and failures are tool errors that start with [outcome=... reason=... "
         "category=...]. `readiness` reports, without running anything, whether commands can be "
         "started for a scope.\n"
@@ -70,7 +73,7 @@ mcp = FastMCP(
         "and retrieve job_result. Only confirmed owned termination is final."
     ),
 )
-ops = guard.Operations(mcp)
+ops = guard.Operations(mcp, preserve_file_content=True)
 jobs = execution.register_jobs(ops)
 
 READ = ToolAnnotations(readOnlyHint=True)

@@ -57,7 +57,9 @@ class Blocked(OutcomeError):
 
 def clip(text: str, limit: int = MAX_OUTPUT, keep: Literal["both", "tail", "head"] = "both") -> str:
     """Bound output size so one noisy command can't flood the model's context."""
-    text = sanitise(text)
+    operation = _ACTIVE.get()
+    if operation is None or operation.sanitise_output:
+        text = sanitise(text)
     if len(text) <= limit:
         return text
     omitted = len(text) - limit

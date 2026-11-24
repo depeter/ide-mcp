@@ -209,6 +209,11 @@ A valid read, and the same read with the wrong worktree selected:
 C:\dev\app-other\README.md, which is outside expected_root C:\dev\app. Nothing was read, written or run. ...
 ```
 
+Files MCP reads, searches and edit previews preserve file content in both text and structured
+results. Credential labels, payment-related identifiers and URLs do not trigger redaction.
+Scope checks, output limits and the prohibition on accessing `*.properties` files still apply.
+Command and validation output remains sanitised.
+
 New logs are sanitised, run-owned artifacts under the selected scope's `.ide-mcp/logs`.
 Use `read_artifact` with the returned path, SHA-256 and `output_scope` as `expected_root`.
 This route rejects changed artifacts and older raw logs. Artifact write failure is reported

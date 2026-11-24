@@ -357,6 +357,7 @@ class _Active:
     name: str
     needs: tuple[str, ...]
     scope: Scope
+    sanitise_output: bool = True
 
 
 @contextlib.contextmanager
@@ -373,10 +374,14 @@ def activate(scope: Scope, needs: tuple[str, ...] = _PREREQUISITES, name: str = 
 class Operations:
     """The only way to register a tool. Each registration states the operation's kind and its
     prerequisites; the same record wraps the handler in the scope check, gates the shared
-    helpers (common.active) and is what readiness reports, so the three cannot drift apart."""
+    helpers (common.active) and is what readiness reports, so the three cannot drift apart.
 
-    def __init__(self, mcp: Any):
+    Preserving file content excludes operations that execute commands. Errors remain sanitised.
+    """
+
+    def __init__(self, mcp: Any, *, preserve_file_content: bool = False):
         self.mcp = mcp
+        self.preserve_file_content = preserve_file_content
         self.registered: dict[str, Operation] = {}
         self._add = mcp.add_tool
         mcp.tool = self._refuse
@@ -399,12 +404,13 @@ class Operations:
             if "expected_root" not in signature.parameters:
                 raise TypeError(f"{fn.__name__} must take `expected_root` to be registered as a tool.")
             op = Operation(name or fn.__name__, kind, (SCOPE, *needs))
+            sanitise_output = not (self.preserve_file_content and kind == FILE and EXECUTION not in needs)
 
             @functools.wraps(fn)
             async def guarded(*args: Any, **kwargs: Any) -> Any:
                 try:
                     scope = Scope.of(signature.bind_partial(*args, **kwargs).arguments.get("expected_root"))
-                    token = _ACTIVE.set(_Active(op.name, op.needs, scope))
+                    token = _ACTIVE.set(_Active(op.name, op.needs, scope, sanitise_output))
                     try:
                         return await fn(*args, **kwargs)
                     finally:
@@ -422,12 +428,13 @@ class Operations:
                     try:
                         value = await guarded(*args, **kwargs)
                         scope = Scope.of(signature.bind_partial(*args, **kwargs).arguments.get("expected_root"))
+                        text = sanitise(str(value)) if sanitise_output else str(value)
                         if isinstance(value, TextResult):
                             fields = value.fields
                         else:
-                            fields = result_fields(op.name, scope, sanitise(str(value)))
+                            fields = result_fields(op.name, scope, text)
                         return CallToolResult(
-                            content=[TextContent(type="text", text=sanitise(str(value)))],
+                            content=[TextContent(type="text", text=text)],
                             structuredContent=fields,
                             isError=fields["outcome"] not in ("passed", "not_run") or
                                     (fields["outcome"] == "not_run" and fields.get("reason") != "dry_run"),
@@ -533,9 +540,11 @@ def result_fields(operation: str, scope: Scope, text: str, **fields: Any) -> dic
 def result(text: str, *, outcome: str = "passed", complete: bool = True,
            incomplete_reason: str | None = None, **fields: Any) -> TextResult:
     op = _ACTIVE.get()
-    text = sanitise(text)
+    if op.sanitise_output:
+        text = sanitise(text)
+        fields = sanitise_value(fields)
     return TextResult(text, result_fields(op.name, op.scope, text, outcome=outcome, complete=complete,
-                                         incomplete_reason=incomplete_reason, **sanitise_value(fields)))
+                                         incomplete_reason=incomplete_reason, **fields))
 
 
 def finish(value: TextResult) -> TextResult:

@@ -151,11 +151,89 @@ def test_runner_sanitises_before_streaming_and_clipping(tmp_path):
     assert result.output_complete is False
 
 
-def test_structured_read_does_not_leak_redacted_credentials(tmp_path):
-    f = tmp_path / "a.txt"
-    f.write_text("password=synthetic-secret\n", encoding="utf-8")
-    result = run(fs.mcp.call_tool("read_file", {"path": str(f), "expected_root": str(tmp_path)}))
-    assert "synthetic-secret" not in str(result.structuredContent)
+_FILE_SOURCE = (
+    "password = credentials.password\n"
+    "api_key = settings.api_key\n"
+    'host = "https://username:placeholder@host.invalid"\n'
+    "payload = compose_payload()\n"
+    "PAN = reference.card_number\n"
+    'example = "local.properties:12"'
+)
+
+
+@pytest.mark.parametrize("operation", ["read_file", "read_files", "search_in_files"])
+@pytest.mark.parametrize("sdk", [False, True], ids=["direct", "sdk"])
+def test_file_source_is_not_redacted(tmp_path, operation, sdk):
+    f = tmp_path / "Source.kt"
+    f.write_text(_FILE_SOURCE, encoding="utf-8")
+    arguments = {"expected_root": str(tmp_path)}
+    if operation == "read_file":
+        arguments.update(path=str(f), include_revision=True)
+    elif operation == "read_files":
+        arguments["items"] = [{"path": str(f), "include_revision": True}]
+    else:
+        arguments.update(query=".", regex=True, file_glob="*.kt")
+    if sdk:
+        response = run(fs.mcp.call_tool(operation, arguments))
+        assert response.isError is False
+        text, fields = response.content[0].text, response.structuredContent
+    else:
+        response = run(getattr(fs, operation)(**arguments))
+        text, fields = str(response), response.fields
+    assert fields["result"] == text
+    assert fields["complete"] is True
+    assert all(line in text for line in _FILE_SOURCE.splitlines())
+    if operation != "search_in_files":
+        item = fields["data"] if operation == "read_file" else fields["data"]["items"][0]
+        assert item["content"] == _FILE_SOURCE
+        assert item["revision"] == revision(f)
+
+
+def test_file_edit_preview_preserves_the_complete_source(tmp_path):
+    f = tmp_path / "Source.kt"
+    f.write_bytes(_FILE_SOURCE.encode("utf-8"))
+    updated = "\n".join(line + " # updated" for line in _FILE_SOURCE.splitlines())
+    response = run(fs.mcp.call_tool("edit_files", {
+        "edits": [{"path": str(f), "expected_revision": revision(f),
+                   "replacements": [{"old_text": _FILE_SOURCE, "new_text": updated}]}],
+        "expected_root": str(tmp_path),
+    }))
+    assert response.isError is False
+    assert response.structuredContent["reason"] == "dry_run"
+    text = response.content[0].text
+    assert response.structuredContent["result"] == text
+    assert all("-" + line in text for line in _FILE_SOURCE.splitlines())
+    assert all("+" + line in text for line in updated.splitlines())
+    assert f.read_text(encoding="utf-8") == _FILE_SOURCE
+
+
+def test_file_replacement_confirmation_preserves_source(tmp_path):
+    f = tmp_path / "Source.kt"
+    f.write_text("original\n", encoding="utf-8")
+    response = run(fs.mcp.call_tool("replace_text", {
+        "path": str(f), "old_text": "original", "new_text": _FILE_SOURCE,
+        "expected_revision": revision(f), "expected_root": str(tmp_path),
+    }))
+    assert response.isError is False
+    assert all(line in response.content[0].text for line in _FILE_SOURCE.splitlines())
+    assert response.structuredContent["result"] == response.content[0].text
+    assert f.read_text(encoding="utf-8") == _FILE_SOURCE + "\n"
+
+
+def test_other_servers_keep_their_output_redaction(tmp_path):
+    from mcp.server.fastmcp import FastMCP
+
+    mcp = FastMCP("other")
+    ops = guard.Operations(mcp)
+
+    @ops.tool(kind="file", needs=(guard.TARGET,))
+    async def source(expected_root: guard.ExpectedRoot = None) -> str:
+        return guard.result(_FILE_SOURCE, data={"password": "synthetic-secret"})
+
+    response = run(mcp.call_tool("source", {"expected_root": str(tmp_path)}))
+    assert response.isError is False
+    assert "credentials.password" not in response.content[0].text
+    assert "synthetic-secret" not in str(response.structuredContent)
 
 
 def test_explicit_protected_shell_target_is_blocked_before_launch(tmp_path):
