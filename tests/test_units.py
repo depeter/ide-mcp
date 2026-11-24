@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -62,9 +63,9 @@ def test_replace_text_unique_and_ambiguous(tmp_path: Path):
     f.write_text("one\ntwo\none\n")
     with pytest.raises(ToolError, match="matches 2 places"):
         run(fs.replace_text(str(f), "one", "1", expected_root=str(tmp_path)))
-    run(fs.replace_text(str(f), "two", "2", expected_root=str(tmp_path)))
+    run(fs.replace_text(str(f), "two", "2", expected_root=str(tmp_path), expected_revision=hashlib.sha256(f.read_bytes()).hexdigest()))
     assert f.read_text() == "one\n2\none\n"
-    run(fs.replace_text(str(f), "one", "1", replace_all=True, expected_root=str(tmp_path)))
+    run(fs.replace_text(str(f), "one", "1", replace_all=True, expected_root=str(tmp_path), expected_revision=hashlib.sha256(f.read_bytes()).hexdigest()))
     assert f.read_text() == "1\n2\n1\n"
     with pytest.raises(ToolError, match="not found"):
         run(fs.replace_text(str(f), "missing", "x", expected_root=str(tmp_path)))
@@ -73,10 +74,10 @@ def test_replace_text_unique_and_ambiguous(tmp_path: Path):
 def test_replace_text_keeps_crlf_and_backslashes(tmp_path: Path):
     f = tmp_path / "a.txt"
     f.write_bytes(b"a\r\nb\r\nc\r\n")
-    run(fs.replace_text(str(f), "a\nb", r"x\1\ny", expected_root=str(tmp_path)))
+    run(fs.replace_text(str(f), "a\nb", r"x\1\ny", expected_root=str(tmp_path), expected_revision=hashlib.sha256(f.read_bytes()).hexdigest()))
     assert f.read_bytes() == b"x\\1\\ny\r\nc\r\n"  # literal mode: backslashes are not escapes
     f.write_text("val x = 1\n")
-    run(fs.replace_text(str(f), r"val (\w+)", r"var \1", regex=True, expected_root=str(tmp_path)))
+    run(fs.replace_text(str(f), r"val (\w+)", r"var \1", regex=True, expected_root=str(tmp_path), expected_revision=hashlib.sha256(f.read_bytes()).hexdigest()))
     assert f.read_text() == "var x = 1\n"
 
 
@@ -86,7 +87,7 @@ def test_create_read_move_delete(tmp_path: Path):
     with pytest.raises(ToolError, match="already exists"):
         run(fs.create_file(str(f), "x", expected_root=str(tmp_path)))
     out = run(fs.read_file(str(f), start_line=2, max_lines=1, expected_root=str(tmp_path)))
-    assert "lines 2-2 of 3" in out and "2\tl2" in out and "start_line=3" in out
+    assert "lines 2-2 of unknown" in out and "2\tl2" in out and "start_line=3" in out
     run(fs.move_path(str(f), str(tmp_path / "b.txt"), expected_root=str(tmp_path)))
     assert (tmp_path / "b.txt").exists() and not f.exists()
     with pytest.raises(ToolError, match="non-empty"):
@@ -195,6 +196,7 @@ def test_find_project_and_modules(tmp_path: Path):
     (root / "app" / "src" / "main").mkdir(parents=True)
     (root / "settings.gradle.kts").write_text("")
     (root / "gradlew").write_text("#!/bin/sh\n")
+    (root / "gradlew.bat").write_text("@echo off\n")
     (root / "app" / "build.gradle.kts").write_text("")
     (root / "features" / "login").mkdir(parents=True)
     (root / "features" / "login" / "build.gradle").write_text("")
@@ -204,8 +206,10 @@ def test_find_project_and_modules(tmp_path: Path):
     assert gradle.find_project(str(tmp_path / "repo")).root == root  # found below
     assert set(gradle.module_dirs(root)) == {":", ":app", ":features:login"}
     assert gradle.module_of(src, root) == ":app"
+    non_build = tmp_path / "non-build"
+    non_build.mkdir()
     with pytest.raises(ToolError, match="No Gradle build"):
-        gradle.find_project("/usr/share")
+        gradle.find_project(str(non_build))
 
 
 def test_collect_tests(tmp_path: Path):
@@ -415,7 +419,8 @@ def test_plan_and_write_workspace_edit(tmp_path: Path):
         ]
     }
     with scoped(tmp_path):
-        changes = lsp.plan_workspace_edit(edit)
+        changes = lsp.plan_workspace_edit(edit, {a.as_uri(): (0, a.read_bytes().decode("utf-8")),
+                                                  b.as_uri(): (0, b.read_bytes().decode("utf-8"))})
         assert a.read_text() == "class Old\n"  # planning does not write
         by_name = {c.path.name: c for c in changes}
         assert by_name["Use.kt"].changed_lines() == [(1, "val x = New()")]

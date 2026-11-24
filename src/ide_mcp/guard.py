@@ -13,14 +13,17 @@ from __future__ import annotations
 import contextlib
 import errno
 import functools
+import hashlib
 import inspect
 import os
+import re
 import stat
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Callable, Iterator, Literal
 
+from mcp.types import CallToolResult, TextContent
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -36,12 +39,14 @@ from .common import (
     protected_name,
     real,
     resolve,
+    sanitise,
+    sanitise_value,
     within,
     worktree_root,
 )
 
-# Version of the request contract (tool arguments). 2.0 made `expected_root` mandatory.
-CONTRACT_VERSION = "2.0"
+# Request contract: 3.0 requires revisions for content writes and IDs for semantic pages.
+CONTRACT_VERSION = "3.0"
 # Version of the readiness response, independent of the package version.
 READINESS_SCHEMA_VERSION = "1.0"
 
@@ -56,7 +61,7 @@ ExpectedRoot = Annotated[
 ]
 
 MISSING_SCOPE = (
-    "expected_root is required (request contract 2.0). Pass the absolute path of the Git worktree, project root or "
+    "expected_root is required (request contract 3.0). Pass the absolute path of the Git worktree, project root or "
     "document folder this request is meant for. The server does not fall back to its start directory."
 )
 
@@ -75,7 +80,6 @@ class Scope:
     root: Path  # resolved
     ident: Identity
     worktree: Path | None  # the Git checkout `root` belongs to, if any
-    _worktrees: dict[str, Path | None] = field(default_factory=dict, compare=False, repr=False)
 
     @classmethod
     def of(cls, expected_root: str | None) -> "Scope":
@@ -108,10 +112,7 @@ class Scope:
 
     def _worktree_of(self, resolved: Path) -> Path | None:
         start = resolved if resolved.is_dir() else resolved.parent
-        key = str(start)
-        if key not in self._worktrees:
-            self._worktrees[key] = worktree_root(start)
-        return self._worktrees[key]
+        return worktree_root(start)
 
     def check(self, target: str | os.PathLike[str], *, protected: bool = True) -> Path:
         """Validate one target and return its resolved path, which is what must then be used.
@@ -120,6 +121,8 @@ class Scope:
         a junction), one that belongs to a different Git worktree than the scope, and, unless
         `protected=False` for directories and launch locations, a protected file under any of
         its spellings. Only names and directory metadata are consulted; no content is opened."""
+        if identity(self.root) != self.ident:
+            raise Blocked("target_changed", "The selected scope directory was replaced. Select it again.")
         lexical = self.lexical(target)
         if WINDOWS and any(":" in part for part in lexical.parts[1:]):
             if protected_name(lexical.name):
@@ -204,11 +207,9 @@ class Scope:
 
     # ---- access
 
-    def read_bytes(self, target: str | os.PathLike[str], limit: int | None = None) -> bytes:
-        """Read a file. The path is validated, opened, and the open handle is then compared with
-        the validated path before any byte is read, so a link or directory swapped in between
-        the check and the open is caught rather than followed. With `limit`, a larger file is
-        refused (FileTooLarge) without being read."""
+    @contextlib.contextmanager
+    def open_read(self, target: str | os.PathLike[str]):
+        """Open a verified regular file. Callers must bound their reads."""
         resolved = self.check(target)
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOINHERIT", 0)
         try:
@@ -219,14 +220,22 @@ class Scope:
             raise
         try:
             self._verify_open(fd, resolved, expect_regular=True)
-            if limit is not None and os.fstat(fd).st_size > limit:
-                raise FileTooLarge(f"{resolved} is larger than {limit} bytes.")
             with os.fdopen(fd, "rb") as f:
                 fd = -1
-                return f.read()
+                yield f
         finally:
             if fd >= 0:
                 os.close(fd)
+
+    def read_bytes(self, target: str | os.PathLike[str], limit: int | None = None) -> bytes:
+        """Read guarded bytes. Refuse oversize files before reading and detect growth."""
+        with self.open_read(target) as f:
+            if limit is not None and os.fstat(f.fileno()).st_size > limit:
+                raise FileTooLarge(f"{target} is larger than {limit} bytes.")
+            data = f.read() if limit is None else f.read(limit + 1)
+            if limit is not None and len(data) > limit:
+                raise FileTooLarge(f"{target} grew beyond {limit} bytes.")
+            return data
 
     def _changed(self, resolved: Path) -> Blocked:
         return Blocked(
@@ -258,14 +267,34 @@ class Scope:
                 raise self._changed(resolved)
         return resolved
 
-    def write_bytes(self, target: str | os.PathLike[str], data: bytes) -> Path:
-        """Replace a file's contents atomically. The destination is resolved through its existing
-        parent and validated before anything is created; the temporary file is confirmed to sit
-        in the validated directory before the payload is written to it."""
+    def require_revision(self, target: Path, expected_revision: str) -> None:
+        """Compare actual bytes, including BOM and line endings. '-' requires absence."""
         resolved = self.check(target)
+        if expected_revision == "-":
+            matches = not os.path.lexists(resolved)
+        else:
+            try:
+                matches = hashlib.sha256(self.read_bytes(resolved, 8_000_000)).hexdigest() == expected_revision
+            except FileNotFoundError:
+                matches = False
+        if not matches:
+            raise Blocked("stale_revision", f"{resolved} no longer has the expected revision. Read and preview again.", "input")
+
+    def write_bytes(self, target: str | os.PathLike[str], data: bytes, *, expected_revision: str | None = None) -> Path:
+        """Stage and replace one file, with a last-moment revision check."""
+        with self.stage_write(target, data, expected_revision=expected_revision) as commit:
+            return commit()
+
+    @contextlib.contextmanager
+    def stage_write(self, target: str | os.PathLike[str], data: bytes, *, expected_revision: str | None = None):
+        """Stage guarded bytes without replacing source. The caller invokes the yielded commit."""
+        resolved = self.check(target)
+        if expected_revision is not None:
+            self.require_revision(resolved, expected_revision)
         parent = self.make_dirs(resolved.parent)
         mode = resolved.stat().st_mode & 0o7777 if resolved.exists() else None
         fd, tmp = tempfile.mkstemp(dir=parent, prefix=f".{resolved.name}.", suffix=".tmp")
+        staged_stat = os.fstat(fd)
         try:
             try:
                 self._verify_open(fd, Path(tmp), expect_regular=True)
@@ -276,20 +305,29 @@ class Scope:
                 raise
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
+                staged_stat = os.fstat(f.fileno())
             if mode is not None:
                 os.chmod(tmp, mode)
             else:
                 umask = os.umask(0)
                 os.umask(umask)
                 os.chmod(tmp, 0o666 & ~umask)
-            os.replace(tmp, resolved)
-        except BaseException:
+            def commit():
+                if self.check(resolved) != resolved or self.check(tmp) != Path(tmp):
+                    raise self._changed(resolved)
+                if not os.path.samestat(staged_stat, os.stat(tmp, follow_symlinks=False)) or self.read_bytes(tmp, len(data)) != data:
+                    raise self._changed(Path(tmp))
+                if expected_revision is not None:
+                    self.require_revision(resolved, expected_revision)
+                os.replace(tmp, resolved)
+                return resolved
+            yield commit
+        finally:
             try:
-                os.unlink(tmp)
-            except OSError:
+                if self.check(tmp) == Path(tmp) and os.path.samestat(staged_stat, os.stat(tmp, follow_symlinks=False)):
+                    os.unlink(tmp)
+            except (OSError, Blocked):
                 pass
-            raise
-        return resolved
 
 
 # ----------------------------------------------------------------------------- registration
@@ -376,7 +414,39 @@ class Operations:
                 except ToolError as e:
                     raise OutcomeError("failed", str(e), category=e.category) from None
 
-            self._add(guarded, name=name, **options)
+            if kind == READINESS:
+                self._add(guarded, name=name, **options)
+            else:
+                @functools.wraps(fn)
+                async def sdk_handler(*args: Any, **kwargs: Any) -> CallToolResult:
+                    try:
+                        value = await guarded(*args, **kwargs)
+                        scope = Scope.of(signature.bind_partial(*args, **kwargs).arguments.get("expected_root"))
+                        if isinstance(value, TextResult):
+                            fields = value.fields
+                        else:
+                            fields = result_fields(op.name, scope, sanitise(str(value)))
+                        return CallToolResult(
+                            content=[TextContent(type="text", text=sanitise(str(value)))],
+                            structuredContent=fields,
+                            isError=fields["outcome"] not in ("passed", "not_run") or
+                                    (fields["outcome"] == "not_run" and fields.get("reason") != "dry_run"),
+                        )
+                    except (OutcomeError, OSError) as e:
+                        text = sanitise(str(e))
+                        fields = {
+                            "schema_version": "1.0", "operation": op.name, "result": text,
+                            "resolved_scope": None, "worktree_root": None, "outcome": getattr(e, "outcome", "failed"),
+                            "reason": getattr(e, "reason", "access_failed"), "category": getattr(e, "category", "environment"),
+                            "complete": False, "incomplete_reason": "operation_failed", "continuation": None, "data": {},
+                        }
+                        if details := getattr(e, "fields", None):
+                            fields = details
+                        return CallToolResult(content=[TextContent(type="text", text=text)],
+                                              structuredContent=fields, isError=True)
+                setattr(sdk_handler, "__signature__", inspect.signature(fn, eval_str=True).replace(  # noqa: B010 - runtime SDK signature metadata
+                    return_annotation=Annotated[CallToolResult, OperationResult]))
+                self._add(sdk_handler, name=name, **options)
             self.registered[op.name] = op
             return guarded
 
@@ -413,6 +483,73 @@ class Operations:
 
 
 # ----------------------------------------------------------------------------- results
+
+
+class OperationResult(BaseModel):
+    schema_version: str = "1.0"
+    operation: str
+    result: str
+    resolved_scope: str | None
+    worktree_root: str | None
+    outcome: Literal["passed", "failed", "blocked", "timed_out", "cancelled", "not_run"]
+    reason: str | None = None
+    category: str | None = None
+    complete: bool
+    incomplete_reason: str | None = None
+    continuation: dict[str, Any] | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class TextResult(str):
+    """Legacy text and structured facts from the same operation, not separate queries."""
+    fields: dict[str, Any]
+
+    def __new__(cls, text: str, fields: dict[str, Any]):
+        instance = super().__new__(cls, text)
+        instance.fields = fields
+        return instance
+
+
+def result_fields(operation: str, scope: Scope, text: str, **fields: Any) -> dict[str, Any]:
+    if not fields:
+        head = re.search(r"\[outcome=(\w+)(?: reason=(\w+))?", text)
+        if head:
+            fields.update(outcome=head[1], reason=head[2])
+        provenance = re.search(r"\[engine=(\w+) requested=(\w+) project=(.+?) complete=(true|false)(?: incomplete_reason=(\w+))?\]", text)
+        if provenance:
+            fields.update(complete=provenance[4] == "true", incomplete_reason=provenance[5] or None,
+                          data={"engine": provenance[1], "requested_engine": provenance[2],
+                                "project_root": provenance[3], "semantic_variant": None,
+                                "backend_collection_bound": "unverified"})
+    return OperationResult(
+        operation=operation, result=text, resolved_scope=str(scope.root),
+        worktree_root=str(scope.worktree) if scope.worktree else None,
+        outcome=fields.pop("outcome", "passed"), complete=fields.pop("complete", False),
+        incomplete_reason=fields.pop("incomplete_reason", "legacy_completeness_unverified"),
+        **fields,
+    ).model_dump(mode="json")
+
+
+def result(text: str, *, outcome: str = "passed", complete: bool = True,
+           incomplete_reason: str | None = None, **fields: Any) -> TextResult:
+    op = _ACTIVE.get()
+    text = sanitise(text)
+    return TextResult(text, result_fields(op.name, op.scope, text, outcome=outcome, complete=complete,
+                                         incomplete_reason=incomplete_reason, **sanitise_value(fields)))
+
+
+def finish(value: TextResult) -> TextResult:
+    """Keep direct-call errors and SDK structured errors consistent."""
+    f = value.fields
+    if not str(value).startswith("[outcome="):
+        text = f"[outcome={f['outcome']}]\n{value}"
+        f = {**f, "result": text}
+        value = TextResult(text, f)
+    if f["outcome"] not in ("passed",) and not (f["outcome"] == "not_run" and f["reason"] == "dry_run"):
+        error = OutcomeError(f["outcome"], str(value), reason=f["reason"], category=f["category"])
+        error.fields = f
+        raise error
+    return value
 
 
 def outcome(result: str, text: str, *, category: str | None = None, reason: str | None = None) -> str:

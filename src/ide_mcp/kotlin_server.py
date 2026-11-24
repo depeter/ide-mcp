@@ -5,18 +5,20 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import hashlib
+import json
 import os
 import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import gradle, guard, lsp, symbols
+from . import execution, gradle, guard, lsp, symbols
 from .common import (
     Blocked,
     OutcomeError,
@@ -76,12 +78,16 @@ mcp = FastMCP(
         "rename_symbol is always semantic and works in two calls: a preview that writes nothing and "
         "returns a preview_id, then dry_run=false with that preview_id, which is rejected as stale "
         "if anything changed in between. find_implementations, find_callers and find_callees are "
-        "separate, direct, bounded queries; they describe static relationships, not a runtime "
+        "separate, direct queries with bounded responses but unbounded backend collection; "
+        "continuations require offset and query_id. They describe static relationships, not a runtime "
         "order, and do not follow chains. find_symbol and file_outline read source text and resolve "
-        "nothing. Run compile after a rename."
+        "nothing. Partial imports and unverified Android model variants block rename before "
+        "preview or apply. Request contract 3.0 returns legacy text and structured schema 1.0. "
+        "start_validation uses shared scoped jobs. Run compile after an authorised rename."
     ),
 )
 ops = guard.Operations(mcp)
+jobs = execution.register_jobs(ops)
 
 READ = ToolAnnotations(readOnlyHint=True)
 ACT = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
@@ -146,9 +152,10 @@ class Progress:
             self._task.cancel()
 
 
-async def _run(ctx: Context | None, project: GradleProject, args: list[str], timeout: float) -> GradleRun:
+async def _run(ctx: Context | None, project: GradleProject, args: list[str], timeout: float,
+               report_dirs: list[tuple[str, Path]] | None = None) -> GradleRun:
     async with Progress(ctx) as p:
-        return await gradle.run_gradle(project, args, timeout=timeout, on_line=p.on_line)
+        return await gradle.run_gradle(project, args, timeout=timeout, on_line=p.on_line, report_dirs=report_dirs)
 
 
 async def _tasks(ctx: Context | None, project: GradleProject, refresh: bool = False) -> dict[str, dict[str, str]]:
@@ -189,13 +196,34 @@ def _finish(run: GradleRun, text: str, *, source: bool = False, not_run: str = "
     """State the outcome of a Gradle run. `source` says the failure is located in project code
     (compiler errors, failing tests, lint findings); other build failures are not classified,
     since a broken build script and a broken environment look alike from here."""
+    from .validation import classify_failure
+    category, reason = classify_failure(run.output)
+    diagnostics = gradle.parse_output(run.output, run.project.root).diagnostics
+    complete = (run.output_complete and len(diagnostics) <= 200 and
+                (run.test_summary is None or run.test_summary.complete))
     if run.timed_out:
-        return guard.outcome("timed_out", text, category="unknown")
-    if not run.ok or source:
-        return guard.outcome("failed", text, category="source" if source else "unknown")
-    if not_run:
-        return guard.outcome("not_run", text, reason=not_run)
-    return guard.outcome("passed", text)
+        outcome, category, reason = "timed_out", "unknown", "execution_timeout"
+    elif not run.ok or source:
+        outcome, category = "failed", "source" if source else category
+    elif not_run or not complete:
+        outcome, reason = "not_run", not_run or "validation_unverified"
+    else:
+        outcome, category, reason = "passed", None, None
+    summary = run.test_summary
+    return guard.finish(guard.result(f"[outcome={outcome}]\n" + text, outcome=outcome,
+                        reason=reason, category=category, complete=complete,
+                        incomplete_reason=None if complete else "incomplete_evidence",
+                        data={"executable": run.project.launcher[0], "tasks_and_filters": run.args,
+                              "project_root": str(run.project.root), "exit_code": run.code,
+                              "duration_seconds": run.seconds, "source_start": run.source_start,
+                              "source_end": run.source_end, "artifacts": run.artifacts,
+                              "diagnostics": [{"path": d.path, "line": d.line, "column": d.col,
+                                               "severity": d.severity, "message": d.message, "rule": d.rule}
+                                              for d in diagnostics[:200]],
+                              "tests": None if summary is None else {
+                                  "executed": summary.executed, "skipped": summary.skipped,
+                                  "failed": summary.failed, "reused": summary.reused,
+                                  "complete": summary.complete}}))
 
 
 def _modules(
@@ -311,7 +339,7 @@ async def gradle_tasks(
 
 @ops.tool(kind="execution", needs=(PROJECT, EXECUTION), annotations=DESTRUCTIVE)
 async def gradle_run(
-    ctx: Context,
+    ctx: Context | None,
     tasks: Annotated[list[str], Field(description="Tasks to run, e.g. [':app:assembleDebug'] or ['clean', 'build'].")],
     args: Annotated[list[str] | None, Field(description="Extra Gradle arguments, e.g. ['--offline', '-Pfoo=bar', '--stacktrace'].")] = None,
     project_dir: ProjectDir = None,
@@ -329,15 +357,27 @@ async def gradle_run(
     if not tasks and not args:
         raise ToolError("Give at least one task.")
     gradle.check_arguments(project, [*tasks, *(args or [])])
-    run = await _run(ctx, project, [*tasks, *(args or [])], timeout_sec)
+    report_dirs = None
+    if any("test" in t.lower() for t in tasks):
+        modules = gradle.module_dirs(project.root)
+        report_dirs = []
+        for task in tasks:
+            module, _, name = task.rpartition(":")
+            if not name.lower().startswith("test"):
+                continue
+            selected = [module or ":"] if ":" in task else list(modules)
+            for target in selected:
+                if target in modules:
+                    report_dirs.append((task_path(target, name), modules[target] / "build/test-results" / name))
+    run = await _run(ctx, project, [*tasks, *(args or [])], timeout_sec, report_dirs=report_dirs)
     rep = gradle.parse_output(run.output, project.root)
     extra = ""
-    if any("test" in t.lower() for t in tasks):
-        dirs = [d / "build" / "test-results" for d in gradle.module_dirs(project.root).values()]
-        summary = await asyncio.to_thread(gradle.collect_tests, dirs, run.started)
-        if summary.suites:
-            extra = summary.render()
-            return _finish(run, format_run(run, rep, show_warnings=show_warnings, extra=extra), source=bool(rep.errors or summary.failed))
+    if run.test_summary is not None:
+        summary = run.test_summary
+        extra = summary.render()
+        return _finish(run, format_run(run, rep, show_warnings=show_warnings, extra=extra),
+                       source=bool(rep.errors or summary.failed),
+                       not_run="" if summary.executed else "no_tests_executed")
     return _finish(run, format_run(run, rep, show_warnings=show_warnings, extra=extra), source=bool(rep.errors))
 
 
@@ -347,7 +387,7 @@ def format_run(run: GradleRun, rep: gradle.Report, **kw) -> str:
 
 @ops.tool(name="compile", kind="execution", needs=(TARGET, PROJECT, EXECUTION), annotations=ACT)
 async def compile_sources(
-    ctx: Context,
+    ctx: Context | None,
     project_dir: ProjectDir = None,
     module: Module = None,
     file: SourceFile = None,
@@ -359,7 +399,7 @@ async def compile_sources(
 ) -> str:
     """Compile Kotlin and Java without packaging, and report errors as path:line:col. This is
     the way to check whether an edit is correct. With `file`, only that file's module is
-    compiled and only that file's problems are listed; with `module`, that module; with neither,
+    compiled and its errors are listed first, followed by sibling errors; with `module`, that module; with neither,
     every module. A test file passed as `file` compiles test sources automatically."""
     src = _source(file)
     project = _project(project_dir, file)
@@ -406,7 +446,7 @@ def _guess_test_module(project: GradleProject, patterns: list[str]) -> str | Non
 
 @ops.tool(kind="execution", needs=(TARGET, PROJECT, EXECUTION), annotations=ACT)
 async def run_tests(
-    ctx: Context,
+    ctx: Context | None,
     project_dir: ProjectDir = None,
     module: Module = None,
     file: Annotated[str | None, Field(description="Absolute path of a test file; runs the tests in that file.")] = None,
@@ -461,17 +501,17 @@ async def run_tests(
     if len(ran) > 1:
         args.append("--continue")
 
-    run = await _run(ctx, project, args, timeout_sec)
+    run = await _run(ctx, project, args, timeout_sec, report_dirs=ran)
     rep = gradle.parse_output(run.output, project.root)
     # Only trust result files of tasks that actually ran; otherwise a compile failure would
     # report the previous run's results.
-    executed = [d for tp, d in ran if re.search(rf"^> Task {re.escape(tp)}(?: (?!NO-SOURCE|SKIPPED)\S+)?$", run.output, re.M)]
-    summary = await asyncio.to_thread(gradle.collect_tests, executed, 0.0)
+    summary = run.test_summary or gradle.TestSummary(complete=False, problems=["run-owned reports unavailable"])
     if summary.failed:
         # Gradle's own message only says "There were failing tests"; the failures say more.
         rep.what_went_wrong = ""
     text = format_run(run, rep, extra="\n".join([summary.render(), *notes]), tail=not summary.failed)
-    return _finish(run, text, source=bool(rep.errors or summary.failed), not_run="" if summary.total else "no_tests_executed")
+    return _finish(run, text, source=bool(rep.errors or summary.failed),
+                   not_run="" if summary.executed else "no_tests_executed")
 
 
 # ----------------------------------------------------------------------------- static analysis
@@ -505,7 +545,7 @@ def _findings(title: str, run: GradleRun | None, diags: list[gradle.Diagnostic],
 
 
 async def _lint_via_gradle(
-    ctx: Context,
+    ctx: Context | None,
     project: GradleProject,
     tasks: dict[str, dict[str, str]],
     mods: list[str] | None,
@@ -534,8 +574,7 @@ def _lint_result(title: str, run: GradleRun, project: GradleProject, only: set[s
     findings = [d for d in rep.diagnostics if d.rule]
     if run.timed_out or (not run.ok and not findings):
         return _finish(run, format_run(run, rep))  # the build itself broke; show why
-    shown = [d for d in findings if only is None or d.key in only]
-    return _lint_outcome(_findings(title, run, findings, project.root, only), bool(shown))
+    return _finish(run, _findings(title, run, findings, project.root, only), source=bool(findings))
 
 
 def _lint_outcome(text: str, findings: bool) -> str:
@@ -547,7 +586,7 @@ _TASK_NAME = re.compile(r"[A-Za-z][\w.\-]*")
 
 @ops.tool(kind="execution", needs=(TARGET, PROJECT, EXECUTION), annotations=ACT)
 async def detekt(
-    ctx: Context,
+    ctx: Context | None,
     project_dir: ProjectDir = None,
     module: Module = None,
     files: Annotated[
@@ -602,7 +641,7 @@ _KTLINT_TASKS = (("ktlintCheck", "ktlintFormat"), ("lintKotlin", "formatKotlin")
 
 @ops.tool(kind="execution", needs=(TARGET, PROJECT, EXECUTION), annotations=ACT)
 async def ktlint(
-    ctx: Context,
+    ctx: Context | None,
     project_dir: ProjectDir = None,
     module: Module = None,
     files: Annotated[
@@ -1125,6 +1164,31 @@ def _completeness(s: lsp.Session, reached_end: bool) -> tuple[bool, str, str]:
     return True, "", ""
 
 
+def _mutation_ready(s: lsp.Session, variant: str | None = None) -> None:
+    s.verify("textDocument/rename")
+    state, reason, detail = s.state(identity(s.root))
+    if state != "ready":
+        raise Blocked(reason or "semantic_not_ready", detail or "Semantic coverage is not ready.")
+    if s.caveat() or s.broken_tasks:
+        raise Blocked("incomplete_semantic_coverage", "Rename is blocked by partial semantic coverage, including omitted test components.")
+    if variant or any((d / "src" / "main" / "AndroidManifest.xml").is_file()
+                      for d in gradle.module_dirs(s.root).values()):
+        raise Blocked("semantic_variant_unverified", "The backend has no verified Android variant selector. Variant-sensitive rename is blocked.")
+
+
+def _semantic_page(s: lsp.Session, rows: list[Any], offset: int, limit: int,
+                   query_id: str | None, selection: str) -> tuple[list[Any], bool, str, str]:
+    documents = [(uri, version, lsp._sha(text)) for uri, (version, text) in sorted(s._open.items())]
+    binding = [str(identity(s.root)), s.started, s.caveat(), selection, documents, rows]
+    digest = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
+    if offset and query_id != digest:
+        raise Blocked("stale_continuation", "Continue with the query_id of the same session, symbol and result set. Query again after a change.", "input")
+    listed, reached_end, more = _page(rows, offset, limit)
+    if more:
+        more += f" query_id={digest}"
+    return listed, reached_end, more, digest
+
+
 @ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=READ)
 async def find_usages(
     ctx: Context,
@@ -1139,6 +1203,7 @@ async def find_usages(
     column: AtColumn = None,
     offset: Offset = 0,
     expected_root: ExpectedRoot = None,
+    query_id: str | None = None,
 ) -> str:
     """Find usages of a symbol across the project. With the Kotlin language server this is
     code-aware, like Find Usages in the IDE: references to that one symbol, ignoring unrelated
@@ -1161,6 +1226,8 @@ async def find_usages(
     except lsp.LspError as e:
         if engine != "auto" or e.category != "environment":
             raise
+        if offset or query_id:
+            raise Blocked("stale_continuation", "The semantic session is no longer available. Start a new query.", "input") from None
         return await _text_find_usages(name, root, file_glob, include_imports, limit, offset, "auto", f"{e.reason}: {e.detail}")
     cache: dict[str, list[str] | None] = {}
     async with s.lock:
@@ -1188,14 +1255,16 @@ async def find_usages(
         if kind == "import" and not include_imports:
             continue
         rows.add((shown, ln + 1, {"usage": " ", "declaration": "D", "import": "I"}[kind], text))
-    listed, reached_end, more = _page(sorted(rows), offset, limit)
+    listed, reached_end, more, digest = _semantic_page(s, sorted(rows), offset, limit, query_id, _key + name)
     complete, reason, note = _completeness(s, reached_end)
     out = [_provenance("semantic", engine, s.root, complete, reason), symbol]
     if note:
         out.append(note)
     if not refs:
         out.append(f"No references to '{name}' found by the language server in {s.root}.")
-        return "\n".join(out)
+        return guard.result("\n".join(out), complete=complete, incomplete_reason=reason or None,
+                            data={"engine": "semantic", "project_root": str(s.root), "query_id": digest,
+                                  "symbol": symbol, "backend_collection_bound": "unbounded", "variant": None})
     out.append(
         f"'{name}': {counts['usage']} usage(s), {counts['declaration']} declaration(s), {counts['import']} import(s) "
         f"on {len(rows)} listed line(s)" + (f" matching {file_glob}" if file_glob else "")
@@ -1209,7 +1278,13 @@ async def find_usages(
         out.append(f"  {ln:>5} {tag} {text}")
     if more:
         out.append(more)
-    return clip("\n".join(out), 50_000, keep="head")
+    text = "\n".join(out)
+    complete = complete and len(text) <= 50_000
+    return guard.result(clip(text, 50_000, keep="head"), complete=complete,
+                        incomplete_reason=None if complete else reason or "output_limit",
+                        continuation={"offset": offset + len(listed), "query_id": digest} if more else None,
+                        data={"engine": "semantic", "project_root": str(s.root), "query_id": digest,
+                              "symbol": symbol, "backend_collection_bound": "unbounded", "variant": None})
 
 
 @ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=DESTRUCTIVE)
@@ -1229,6 +1304,7 @@ async def rename_symbol(
         Field(description="The preview_id returned by the dry run, required with dry_run=false. The edit set is recomputed and applied only if it is identical to the one previewed."),
     ] = None,
     expected_root: ExpectedRoot = None,
+    variant: str | None = None,
 ) -> str:
     """Rename a symbol everywhere it is used, with the language server's rename refactoring:
     only references to that one symbol change; same-named symbols, comments and strings are
@@ -1265,6 +1341,7 @@ async def rename_symbol(
     cache: dict[str, list[str] | None] = {}
     async with s.lock:
         await s.sync()
+        _mutation_ready(s, variant)
         path, pos = await _locate(s, name, file, line, column)
         s.open(path)
         doc = {"textDocument": {"uri": lsp.uri_of(path)}, "position": pos}
@@ -1284,40 +1361,69 @@ async def rename_symbol(
                     category="input", reason="symbol_mismatch",
                 )
         symbol, key, decls = await _describe(s, name, doc, cache)
+        if key == "unresolved" or not decls:
+            raise Blocked("symbol_unresolved", "The backend did not resolve a declaration. No applicable preview can be produced.", "input")
         edit = await s.request("textDocument/rename", {**doc, "newName": new_name}, timeout=300)
         if not edit:
             raise ToolError(f"The language server cannot rename '{name}' at {path}:{pos['line'] + 1} (not a renameable symbol, or it is declared in a library).")
-        changes = await asyncio.to_thread(lsp.plan_workspace_edit, edit)
+        # Establish the exact engine documents before accepting ranges. A second
+        # request is ordered after didOpen and must reproduce the reviewed plan.
+        for change in edit.get("documentChanges") or []:
+            if "textDocument" in change:
+                s.open(lsp.path_of(change["textDocument"]["uri"]))
+        for uri in (edit.get("changes") or {}):
+            s.open(lsp.path_of(uri))
+        documents = dict(s._open)
+        edit = await s.request("textDocument/rename", {**doc, "newName": new_name}, timeout=300)
+        changes = await asyncio.to_thread(lsp.plan_workspace_edit, edit or {}, documents)
         if not changes:
             return guard.outcome("not_run", f"Renaming '{name}' to '{new_name}' changes nothing.", reason="no_occurrences", category="input")
 
         # Keep the file name in step with a top-level type it is named after, as the class/file
         # convention requires. Nothing else is ever moved.
-        if rename_files:
+        required_moves: dict[str, Path] = {}
+        if decls:
             for uri, _start in map(_target, decls):
                 dpath = lsp.path_of(uri)
                 change = next((c for c in changes if path_key(c.path) == path_key(dpath)), None)
-                if not uri.startswith("file:") or dpath.stem != name or dpath.suffix not in symbols.SOURCE_SUFFIXES or change is None or change.new_path:
+                if not uri.startswith("file:") or dpath.stem != name or dpath.suffix not in symbols.SOURCE_SUFFIXES or change is None:
                     continue
                 declares_type = any(
                     sym.name == name and not sym.container and sym.kind not in ("fun", "val", "var")
                     for sym in symbols.outline(change.old_text or "", java=dpath.suffix == ".java")
                 )
                 if declares_type:
-                    change.new_path = active().check(dpath.with_name(new_name + dpath.suffix))
+                    if not rename_files:
+                        raise Blocked("declaration_file_required", "This type rename requires its declaration-file move. rename_files=false cannot bypass the convention.")
+                    destination = active().check(dpath.with_name(new_name + dpath.suffix))
+                    if change.new_path and path_key(change.new_path) != path_key(destination):
+                        raise Blocked("unsupported_file_move", "The backend move does not match the required declaration filename.")
+                    required_moves[path_key(change.path)] = destination
+                    change.new_path = destination
         for c in changes:
+            if c.new_path and required_moves.get(path_key(c.path)) != c.new_path:
+                raise Blocked("unsupported_file_move", "Only required declaration-file moves are authorised by semantic rename.")
             if c.new_path and c.new_path != c.path and os.path.lexists(c.new_path) and not lsp._same_file(c.path, c.new_path):
                 raise Blocked(
                     "destination_collision",
                     f"Renaming '{name}' to '{new_name}' moves {rel(c.path, s.root)} to {c.new_path.name}, which already exists. "
-                    "Nothing was changed. Resolve the collision, or pass rename_files=false to leave the file name alone.",
+                    "Nothing was changed. Resolve the destination collision.",
                     "input",
                 )
         outside = [q for c in changes for q in (c.path, c.new_path) if q is not None and not within(q, s.root)]
         if outside:
             raise Blocked("target_mismatch", "The rename would edit files outside the project, so nothing was changed:\n" + "\n".join(f"  {q}" for q in outside[:10]))
 
-        digest = lsp.plan_digest(changes, identity(s.root).path, key, name, new_name)
+        if sum(len(c.changed_lines()) for c in changes) > 150 or sum(len(c.new_text or "") for c in changes) > 500_000:
+            raise Blocked("preview_too_large", "The complete rename preview exceeds its review bound. Narrow the refactoring.", "input")
+        digest = lsp.plan_digest(changes, str(identity(s.root)), str(s.started), key, name, new_name)
+        focused_diff = "".join(
+            "".join(difflib.unified_diff((c.old_text or "").splitlines(keepends=True),
+                                       (c.new_text or "").splitlines(keepends=True),
+                                       fromfile=rel(c.path, s.root), tofile=rel(c.new_path or c.path, s.root), n=2))
+            for c in changes)
+        if len(focused_diff) > 35_000:
+            raise Blocked("preview_too_large", "The complete focused diff exceeds 35,000 characters. Split the refactoring.", "input")
         if not dry_run:
             if not preview_id:
                 raise OutcomeError(
@@ -1333,6 +1439,9 @@ async def rename_symbol(
                     "Nothing was written. Preview again and review the new edit set.",
                     "input",
                 )
+            _mutation_ready(s, variant)
+            if documents != s._open:
+                raise Blocked("stale_document", "The engine document state changed after planning.", "input")
             await asyncio.to_thread(lsp.write_changes, changes)
             s.forget_open()
 
@@ -1354,12 +1463,21 @@ async def rename_symbol(
             out.append(f"  {ln:>5}  {text[:200]}")
         budget -= len(lines)
     if dry_run:
+        out.append(focused_diff)
         out.append(f"preview_id: {digest}")
         out.append(
             "Nothing was written. To apply exactly this edit set, call again with the same arguments, dry_run=false and "
             "this preview_id. It is rejected as stale if any of these files, the symbol or the project has changed by then."
         )
-        return guard.outcome("not_run", clip("\n".join(out), 50_000, keep="head"), reason="dry_run")
+        text = "[outcome=not_run reason=dry_run]\n" + "\n".join(out)
+        if len(text) > 50_000:
+            raise Blocked("preview_too_large", "The full rename preview exceeds 50,000 characters. No clipped preview can be applied.", "input")
+        return guard.result(text, outcome="not_run", reason="dry_run", complete=complete,
+                            data={"engine": "semantic", "project_root": str(s.root), "preview_id": digest,
+                                  "symbol": symbol, "variant": None, "edits": [
+                                      {"path": str(c.path), "destination": str(c.new_path) if c.new_path else None,
+                                       "expected_revision": lsp._sha(c.old_text), "new_revision": lsp._sha(c.new_text),
+                                       "document_version": c.document_version} for c in changes]})
     out.append(f"Applied the edit set previewed as {digest}. Run compile to verify.")
     return guard.outcome("passed", clip("\n".join(out), 50_000, keep="head"))
 
@@ -1368,11 +1486,9 @@ async def rename_symbol(
 
 
 def _dispatch(cache: dict[str, list[str] | None], path: Path | None, line: int) -> str:
-    """How firmly a call target is known, read off its declaration: `exact` for a final
-    declaration, `possible dispatch` when an override may run instead, `unresolved` when the
-    declaration cannot be inspected."""
+    """Conservative declaration-text estimates. These are not backend proof of dispatch."""
     lines = _file_lines(cache, path) if path is not None else None
-    if lines is None or line >= len(lines):
+    if path is None or lines is None or line >= len(lines):
         return "unresolved: declared outside expected_root, so overriding cannot be checked"
     declared = symbols.outline("\n".join(lines), java=path.suffix == ".java")  # type: ignore[union-attr]
     sym = next((d for d in declared if d.line == line + 1), None)
@@ -1384,10 +1500,10 @@ def _dispatch(cache: dict[str, list[str] | None], path: Path | None, line: int) 
         return "possible dispatch: declared in an interface"
     if path.suffix == ".java":  # type: ignore[union-attr]
         virtual = sym.container and not re.search(r"\b(final|static|private)\b", text)
-        return "possible dispatch: an overridable Java method" if virtual else "exact"
+        return "possible dispatch: an overridable Java method" if virtual else "unverified exactness: declaration-text estimate"
     if re.search(r"\b(abstract|open|override)\b", text) and not re.search(r"\bfinal\b", text):
         return "possible dispatch: declared abstract, open or as an override"
-    return "exact"
+    return "unverified exactness: declaration-text estimate"
 
 
 async def _call_item(s: lsp.Session, name: str, doc: dict) -> dict:
@@ -1422,12 +1538,13 @@ async def find_implementations(
     limit: Limit = 100,
     offset: Offset = 0,
     expected_root: ExpectedRoot = None,
+    query_id: str | None = None,
 ) -> str:
     """List the implementations of an interface or abstract class, or the overrides of a member,
     as the language server resolves them (Go to Implementation in the IDE). Semantic only: when
     the language server is missing, not ready or does not offer the request, this is an error
     and nothing is inferred from text. The first line states engine, project and completeness;
-    a truncated listing continues with `offset`."""
+    a truncated listing continues with `offset` and its returned `query_id`."""
     s = await _semantic(ctx, root, file, "Implementations are not inferred from text.", "textDocument/implementation")
     cache: dict[str, list[str] | None] = {}
     async with s.lock:
@@ -1444,7 +1561,7 @@ async def find_implementations(
             rows.append(f"{rel(p, s.root)}:{start[0] + 1}  {_line_text(cache, p, start[0])}".rstrip())
         else:
             rows.append(uri)
-    listed, reached_end, more = _page(rows, offset, limit)
+    listed, reached_end, more, digest = _semantic_page(s, rows, offset, limit, query_id, _key + name)
     complete, reason, note = _completeness(s, reached_end)
     out = [_provenance("semantic", "semantic", s.root, complete, reason), symbol]
     if note:
@@ -1453,10 +1570,16 @@ async def find_implementations(
     out.extend("  " + r for r in listed)
     if more:
         out.append(more)
-    return clip("\n".join(out), 50_000, keep="head")
+    text = "\n".join(out)
+    complete = complete and len(text) <= 50_000
+    return guard.result(clip(text, 50_000, keep="head"), complete=complete,
+                        incomplete_reason=None if complete else reason or "output_limit",
+                        continuation={"offset": offset + len(listed), "query_id": digest} if more else None,
+                        data={"engine": "semantic", "project_root": str(s.root), "query_id": digest,
+                              "symbol": symbol, "variant": None, "backend_collection_bound": "unbounded"})
 
 
-async def _calls(ctx: Context, direction: str, name: str, root: str | None, file: str | None, line: int | None, column: int | None, limit: int, offset: int) -> str:
+async def _calls(ctx: Context, direction: str, name: str, root: str | None, file: str | None, line: int | None, column: int | None, limit: int, offset: int, query_id: str | None = None) -> str:
     method = "callHierarchy/incomingCalls" if direction == "caller" else "callHierarchy/outgoingCalls"
     s = await _semantic(ctx, root, file, "Calls are not inferred from text.", "textDocument/prepareCallHierarchy", method)
     cache: dict[str, list[str] | None] = {}
@@ -1482,7 +1605,8 @@ async def _calls(ctx: Context, direction: str, name: str, root: str | None, file
             row += f"  [{_dispatch(cache, target_path, target_line)}]"
         entries.append((row, sites))
     entries.sort(key=lambda e: e[0])
-    listed, reached_end, more = _page(entries, offset, limit)
+    listed, reached_end, more, digest = _semantic_page(s, entries, offset, limit, query_id, method + _key + name)
+    reached_end = reached_end and all(len(sites) <= 20 for _row, sites in listed)
     complete, reason, note = _completeness(s, reached_end)
     out = [_provenance("semantic", "semantic", s.root, complete, reason), symbol]
     if note:
@@ -1498,7 +1622,13 @@ async def _calls(ctx: Context, direction: str, name: str, root: str | None, file
     if direction == "callee" and any("possible dispatch" in row for row, _ in listed):
         out.append("A 'possible dispatch' target is the declaration the call resolves to statically; an override may run instead. find_implementations on that declaration lists the candidates.")
     out.append(_STATIC_NOTE)
-    return clip("\n".join(out), 50_000, keep="head")
+    text = "\n".join(out)
+    complete = complete and len(text) <= 50_000
+    return guard.result(clip(text, 50_000, keep="head"), complete=complete,
+                        incomplete_reason=None if complete else reason or "output_limit",
+                        continuation={"offset": offset + len(listed), "query_id": digest} if more else None,
+                        data={"engine": "semantic", "project_root": str(s.root), "query_id": digest,
+                              "symbol": symbol, "variant": None, "backend_collection_bound": "unbounded"})
 
 
 @ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=READ)
@@ -1512,6 +1642,7 @@ async def find_callers(
     limit: Limit = 100,
     offset: Offset = 0,
     expected_root: ExpectedRoot = None,
+    query_id: str | None = None,
 ) -> str:
     """List the direct callers of one function: each calling declaration with its call sites, as
     the language server's call hierarchy resolves them. One level only; a function that calls
@@ -1519,7 +1650,7 @@ async def find_callers(
     symbols, selected by `file`, `line` and `column`. Semantic only: an error, never a text
     search, when the language server is missing, not ready or has no call hierarchy. Static
     relationships, not a runtime order."""
-    return await _calls(ctx, "caller", name, root, file, line, column, limit, offset)
+    return await _calls(ctx, "caller", name, root, file, line, column, limit, offset, query_id)
 
 
 @ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=READ)
@@ -1533,15 +1664,15 @@ async def find_callees(
     limit: Limit = 100,
     offset: Offset = 0,
     expected_root: ExpectedRoot = None,
+    query_id: str | None = None,
 ) -> str:
     """List what one function calls directly: each target declaration with the call sites inside
-    the function, as the language server's call hierarchy resolves them. Each target is marked
-    `exact` (a final declaration), `possible dispatch` (an interface, abstract, open or
-    overriding member, so an override may run instead; see find_implementations) or
-    `unresolved` (declared outside expected_root, such as a library). One level only; chains are
+    the function, as the language server's call hierarchy resolves them. Dispatch labels are
+    declaration-text estimates: `unverified exactness`, `possible dispatch` or `unresolved`.
+    They are not backend proof of exact or runtime dispatch. One level only; chains are
     not followed. Semantic only: an error, never a text search, when the language server is
     missing, not ready or has no call hierarchy. Static relationships, not a runtime order."""
-    return await _calls(ctx, "callee", name, root, file, line, column, limit, offset)
+    return await _calls(ctx, "callee", name, root, file, line, column, limit, offset, query_id)
 
 
 def _hover_text(hover: dict | None) -> str:
@@ -1583,8 +1714,13 @@ async def symbol_info(
         decls = [decls]
     text = _hover_text(hover)
     if not text and not decls:
-        return f"Nothing resolvable at {path}:{line}" + (f" ('{name}')" if name else "") + "."
-    out = [text] if text else []
+        complete, reason, note = _completeness(s, True)
+        return guard.result(_provenance("semantic", "semantic", s.root, complete, reason) +
+                            f"\nNothing resolvable at {path}:{line}." + note, complete=complete,
+                            incomplete_reason=reason or None,
+                            data={"engine": "semantic", "project_root": str(s.root), "variant": None})
+    complete, reason, note = _completeness(s, len(decls) <= 5 and len(text) < 18_000)
+    out = [_provenance("semantic", "semantic", s.root, complete, reason), note, text]
     for d in decls[:5]:
         uri = d.get("uri") or d.get("targetUri")
         rng = d.get("range") or d.get("targetSelectionRange")
@@ -1592,7 +1728,9 @@ async def symbol_info(
             out.append(f"Declared at: {rel(lsp.path_of(uri), s.root)}:{rng['start']['line'] + 1}")
         else:
             out.append(f"Declared in: {uri}")
-    return clip("\n".join(out), 20_000, keep="head")
+    return guard.result(clip("\n".join(out), 20_000, keep="head"), complete=complete,
+                        incomplete_reason=reason or None,
+                        data={"engine": "semantic", "project_root": str(s.root), "variant": None})
 
 
 @ops.tool(kind="semantic", needs=(TARGET, PROJECT, SEMANTIC), annotations=READ)
@@ -1624,7 +1762,11 @@ async def file_problems(
     )
     header = f"{rel(path, s.root)}: "
     if not items:
-        return header + f"no problems at {min_severity} level or above."
+        complete, reason, note = _completeness(s, report.get("kind") != "unchanged")
+        return guard.result(_provenance("semantic", "semantic", s.root, complete, reason) + "\n" +
+                            header + f"no problems at {min_severity} level or above.\n" + note,
+                            complete=complete, incomplete_reason=reason or None,
+                            data={"engine": "semantic", "project_root": str(s.root), "variant": None})
     counts: dict[str, int] = {}
     out = []
     for d in items[:200]:
@@ -1644,7 +1786,44 @@ async def file_problems(
     result = [header + summary + ":"] + out
     if len(items) > 200:
         result.append(f"  [... {len(items) - 200} more ...]")
-    return clip("\n".join(result), 40_000, keep="head")
+    complete, reason, note = _completeness(s, len(items) <= 200 and len("\n".join(result)) < 39_000)
+    return guard.result(_provenance("semantic", "semantic", s.root, complete, reason) + "\n" +
+                        clip("\n".join(result), 39_000, keep="head") + note,
+                        complete=complete, incomplete_reason=reason or None,
+                        data={"engine": "semantic", "project_root": str(s.root), "variant": None})
+
+
+@ops.tool(kind="execution", needs=(TARGET, PROJECT, EXECUTION), annotations=ACT)
+async def start_validation(check: Literal["compile", "tests", "detekt", "ktlint", "gradle"],
+                           project_dir: ProjectDir, module: Module = None, file: str | None = None,
+                           variant: Variant = "debug", tests: list[str] | None = None,
+                           tasks: list[str] | None = None, args: list[str] | None = None,
+                           timeout_sec: Timeout = 1800, expected_root: ExpectedRoot = None) -> str:
+    """Start existing Gradle validation through the shared job lifecycle. No semantic variant is selected."""
+    if check not in ("compile", "tests", "detekt", "ktlint", "gradle") or not 1 <= timeout_sec <= 3600:
+        raise ToolError("Select a supported check and a timeout from 1 to 3600 seconds.")
+    project = _project(project_dir, file)
+    _source(file)
+    if check == "gradle":
+        gradle.check_arguments(project, [*(tasks or []), *(args or [])])
+        if not tasks:
+            raise ToolError("Explicit Gradle tasks are required.")
+    async def work():
+        if check == "compile":
+            return await compile_sources(None, project_dir=project_dir, module=module, file=file,
+                                         variant=variant, timeout_sec=timeout_sec, expected_root=expected_root)
+        if check == "tests":
+            return await run_tests(None, project_dir=project_dir, module=module, file=file, tests=tests,
+                                   variant=variant, timeout_sec=timeout_sec, expected_root=expected_root)
+        if check in ("detekt", "ktlint"):
+            return await (detekt if check == "detekt" else ktlint)(
+                None, project_dir=project_dir, module=module, files=[file] if file else None,
+                timeout_sec=timeout_sec, expected_root=expected_root)
+        return await gradle_run(None, tasks=tasks or [], args=args, project_dir=project_dir,
+                                timeout_sec=timeout_sec, expected_root=expected_root)
+    job = jobs.start(work)
+    return guard.result("Validation queued.", complete=False, incomplete_reason="job_not_final",
+                        data={"job_id": job.id, "state": job.state})
 
 
 # ----------------------------------------------------------------------------- readiness
@@ -1692,7 +1871,8 @@ def check() -> int:
     print(f"android: {sdk or 'no SDK found (fine for JVM projects, or when local.properties sets sdk.dir)'}")
     print(f"detekt:  {_find_cli('DETEKT_CLI', 'detekt', 'detekt-cli') or 'no CLI (Gradle detekt tasks are used when present)'}")
     print(f"ktlint:  {_find_cli('KTLINT_CLI', 'ktlint') or 'no CLI (Gradle ktlint/spotless tasks are used when present)'}")
-    print(f"lsp:     {lsp.find_server() or 'not installed (run: kotlin-mcp --install-lsp) - code-aware tools are blocked; engine=\'text\' is the explicit alternative'}")
+    lsp_status = lsp.find_server() or "not installed (run: kotlin-mcp --install-lsp) - code-aware tools are blocked; engine='text' is the explicit alternative"
+    print(f"lsp:     {lsp_status}")
     try:
         project = gradle.find_project(None)
         print(f"gradle:  build at {project.root} via {' '.join(project.launcher)}")

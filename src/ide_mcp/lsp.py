@@ -8,6 +8,7 @@ renames that resolve symbols, and IntelliJ inspections.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import time
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import unquote, urlparse
@@ -185,19 +187,29 @@ def utf16_col(line: str, index: int) -> int:
 
 def py_index(line: str, utf16: int) -> int:
     """Python string index of an LSP character offset within a line."""
+    if not isinstance(utf16, int) or isinstance(utf16, bool) or utf16 < 0:
+        raise ToolError("Invalid UTF-16 character position.")
     units = 0
     for i, ch in enumerate(line):
-        if units >= utf16:
+        if units == utf16:
             return i
         units += 2 if ord(ch) > 0xFFFF else 1
+        if units > utf16:
+            raise ToolError("The position splits a UTF-16 surrogate pair.")
+    if units != utf16:
+        raise ToolError("The character position is past the end of the line.")
     return len(line)
 
 
 def offset_of(lines: list[str], pos: dict) -> int:
     """Absolute string offset of an LSP position; `lines` come from splitlines(keepends=True)."""
-    ln = pos["line"]
-    if ln >= len(lines):
+    ln = pos.get("line")
+    if not isinstance(ln, int) or isinstance(ln, bool) or ln < 0:
+        raise ToolError("Invalid LSP line position.")
+    if ln == len(lines) and pos.get("character") == 0 and (not lines or lines[-1].endswith("\n")):
         return sum(len(s) for s in lines)
+    if ln >= len(lines):
+        raise ToolError("The LSP line position is past the document.")
     body = lines[ln].rstrip("\r\n")
     return sum(len(s) for s in lines[:ln]) + py_index(body, pos["character"])
 
@@ -210,6 +222,13 @@ def apply_text_edits(text: str, edits: list[dict]) -> str:
         key=lambda s: (s[0], s[1]),
         reverse=True,
     )
+    ascending = list(reversed(spans))
+    for start, end, new in spans:
+        if end < start or not isinstance(new, str):
+            raise ToolError("Malformed LSP edit range or replacement.")
+    if any(b[0] < a[1] or (a[0] == a[1] == b[0] == b[1])
+           for a, b in pairwise(ascending)):
+        raise ToolError("Overlapping LSP edits are not supported.")
     crlf = "\r\n" in text
     for start, end, new in spans:
         if crlf:
@@ -227,6 +246,7 @@ class FileChange:
     new_text: str | None  # None when the file is deleted
     new_path: Path | None = None  # set when the file is renamed
     edit_count: int = 0
+    document_version: int | None = None
 
     def changed_lines(self) -> list[tuple[int, str]]:
         if self.old_text is None or self.new_text is None:
@@ -235,7 +255,7 @@ class FileChange:
         return [(i + 1, n.strip()) for i, n in enumerate(new) if i >= len(old) or old[i] != n]
 
 
-def plan_workspace_edit(edit: dict) -> list[FileChange]:
+def plan_workspace_edit(edit: dict, documents: dict[str, tuple[int, str]] | None = None) -> list[FileChange]:
     """Turn a WorkspaceEdit into per-file changes without touching the disk."""
     changes: dict[str, FileChange] = {}
 
@@ -246,16 +266,24 @@ def plan_workspace_edit(edit: dict) -> list[FileChange]:
         key = path_key(path)
         if key not in changes:
             try:
-                text = scope.read_bytes(path).decode("utf-8") if path.is_file() else None
+                text = scope.read_bytes(path, 8_000_000).decode("utf-8") if path.is_file() else None
             except UnicodeDecodeError:
                 raise ToolError(f"{path} is not UTF-8 text, so it cannot be edited without changing its encoding. Nothing was changed.") from None
             changes[key] = FileChange(path, text, text)
         return changes[key]
 
-    def edit_text(path: Path, edits: list[dict]) -> None:
+    def edit_text(path: Path, edits: list[dict], version: int | None = None) -> None:
         c = entry(path)
         if c.new_text is None:
             raise ToolError(f"The rename wants to edit {path}, which does not exist.")
+        uri = uri_of(c.path)
+        if documents is not None:
+            document = documents.get(uri)
+            if document is None or document[1] != c.old_text or (version is not None and version != document[0]):
+                raise Blocked("stale_document", f"{path}: backend document bytes or version differ from disk.", "input")
+            c.document_version = document[0]
+        elif version is not None:
+            raise Blocked("document_version_unverified", f"{path}: no engine document was supplied to verify version {version}.")
         # The server emits several micro-edits per occurrence ("Event" -> "Sig" + "al"), so count
         # edited lines, which is what a reader thinks of as the size of the change.
         c.edit_count += len({e["range"]["start"]["line"] for e in edits})
@@ -267,12 +295,14 @@ def plan_workspace_edit(edit: dict) -> list[FileChange]:
             c = entry(path_of(change["oldUri"]))
             c.new_path = scope.check(path_of(change["newUri"]))
         elif kind == "create":
-            c = entry(path_of(change["uri"]))
-            c.new_text = c.new_text or ""
+            raise Blocked("unsupported_resource_operation", "Semantic rename does not create files.")
         elif kind == "delete":
-            entry(path_of(change["uri"])).new_text = None
+            raise Blocked("unsupported_resource_operation", "Semantic rename does not delete files.")
+        elif kind is None and "textDocument" in change:
+            edit_text(path_of(change["textDocument"]["uri"]), change.get("edits") or [],
+                      change["textDocument"].get("version"))
         else:
-            edit_text(path_of(change["textDocument"]["uri"]), change.get("edits") or [])
+            raise Blocked("unsupported_resource_operation", f"Unsupported workspace edit kind: {kind}.")
     for uri, edits in (edit.get("changes") or {}).items():
         edit_text(path_of(uri), edits)
     return [c for c in changes.values() if c.old_text != c.new_text or c.new_path]
@@ -296,7 +326,8 @@ def plan_digest(changes: list[FileChange], *binding: str) -> str:
     for part in binding:
         h.update(part.encode("utf-8") + b"\0")
     for c in sorted(changes, key=lambda c: path_key(c.path)):
-        for part in (path_key(c.path), _sha(c.old_text), _sha(c.new_text), path_key(c.new_path) if c.new_path else "-"):
+        for part in (path_key(c.path), _sha(c.old_text), _sha(c.new_text), path_key(c.new_path) if c.new_path else "-",
+                     str(c.document_version)):
             h.update(part.encode("utf-8") + b"\0")
     return h.hexdigest()[:16]
 
@@ -336,18 +367,28 @@ def write_changes(changes: list[FileChange]) -> None:
                 raise Blocked("destination_collision", f"{target} already exists, so {path.name} cannot be moved there. Nothing was written.", "input")
     done: list[str] = []
     try:
-        for c in changes:
-            if c.new_text is None:
-                scope.entry(c.path).unlink(missing_ok=True)
-                done.append(f"deleted {c.path}")
-                continue
-            if c.old_text != c.new_text:
-                scope.write_bytes(c.path, c.new_text.encode("utf-8"))
-                done.append(f"edited {c.path}")
-            if c.new_path and c.new_path != c.path:
-                scope.make_dirs(c.new_path.parent)
-                scope.entry(c.path).rename(scope.entry(c.new_path))
-                done.append(f"moved {c.path} -> {c.new_path}")
+        with contextlib.ExitStack() as stack:
+            commits = {
+                c.path: stack.enter_context(scope.stage_write(c.path, c.new_text.encode("utf-8"),
+                                                              expected_revision=_sha(c.old_text)))
+                for c in changes if c.new_text is not None and c.old_text != c.new_text
+            }
+            for c in changes:
+                if c.new_text is None:
+                    scope.require_revision(c.path, _sha(c.old_text))
+                    scope.entry(c.path).unlink(missing_ok=True)
+                    done.append(f"deleted {c.path}")
+                    continue
+                if c.path in commits:
+                    commits[c.path]()
+                    done.append(f"edited {c.path}")
+                if c.new_path and c.new_path != c.path:
+                    scope.make_dirs(c.new_path.parent)
+                    scope.require_revision(c.path, _sha(c.new_text))
+                    if os.path.lexists(c.new_path) and not _same_file(c.path, c.new_path):
+                        raise Blocked("destination_collision", f"{c.new_path} appeared before the move.", "input")
+                    scope.entry(c.path).rename(scope.entry(c.new_path))
+                    done.append(f"moved {c.path} -> {c.new_path}")
     except Exception as e:
         pending = [str(c.path) for c in changes if not any(str(c.path) in d for d in done)]
         partly = [str(c.path) for c in changes if any(str(c.path) in d for d in done) and c.new_path and c.new_path != c.path and not any(d.startswith(f"moved {c.path} ") for d in done)]
@@ -676,11 +717,12 @@ class Session:
                 "workspaceFolders": [{"uri": uri, "name": self.root.name}],
                 "clientInfo": {"name": "ide-mcp"},
                 "capabilities": {
+                    "general": {"positionEncodings": ["utf-16"]},
                     "workspace": {
                         "workspaceFolders": True,
                         "configuration": True,
                         "symbol": {},
-                        "workspaceEdit": {"documentChanges": True, "resourceOperations": ["create", "rename", "delete"]},
+                        "workspaceEdit": {"documentChanges": True, "resourceOperations": ["rename"]},
                         "didChangeWatchedFiles": {"dynamicRegistration": True},
                     },
                     "textDocument": {
@@ -698,6 +740,8 @@ class Session:
             timeout=120,
         )
         self.capabilities = (result or {}).get("capabilities") or {}
+        if self.capabilities.get("positionEncoding", "utf-16") != "utf-16":
+            raise LspError("The backend selected an unsupported position encoding.", "unsupported_position_encoding")
         self.notify("initialized", {})
 
     async def wait_ready(self, timeout: float) -> None:
@@ -777,7 +821,7 @@ class Session:
         if "androidTest" not in self.workaround:
             return False
         parts = path.parts
-        return any(a == "src" and b.startswith("androidTest") for a, b in zip(parts, parts[1:]))
+        return any(a == "src" and b.startswith("androidTest") for a, b in pairwise(parts))
 
     def write_init_script(self) -> None:
         """(Re)create the import init script. The server deletes it after every import, and a
@@ -835,8 +879,8 @@ class Session:
         for uri, (version, text) in list(self._open.items()):
             path = path_of(uri)
             try:
-                disk = scope.read_bytes(path).decode("utf-8", "replace")
-            except (OSError, ToolError):
+                disk = scope.read_bytes(path, 8_000_000).decode("utf-8")
+            except (OSError, ToolError, UnicodeError):
                 self.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
                 del self._open[uri]
                 continue
@@ -853,7 +897,10 @@ class Session:
         uri = uri_of(path)
         if uri in self._open:
             return self._open[uri][1]
-        text = active().read_bytes(path).decode("utf-8", "replace")
+        try:
+            text = active().read_bytes(path, 8_000_000).decode("utf-8")
+        except UnicodeError:
+            raise ToolError("Semantic documents must be valid UTF-8. No transcoding is performed.") from None
         language = "java" if path.suffix == ".java" else "kotlin"
         self.notify("textDocument/didOpen", {"textDocument": {"uri": uri, "languageId": language, "version": 1, "text": text}})
         self._open[uri] = (1, text)

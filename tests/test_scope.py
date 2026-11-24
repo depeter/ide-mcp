@@ -45,11 +45,18 @@ def _wrong_target_calls(a: Path, b: Path):
         "search_in_files": lambda: fs.search_in_files("Door", B, expected_root=A),
         "create_file": lambda: fs.create_file(str(b / "new.txt"), "x", expected_root=A),
         "replace_text": lambda: fs.replace_text(target, "Door", "Gate", replace_all=True, expected_root=A),
+        "edit_files": lambda: fs.edit_files([{"path": target, "expected_revision": "0" * 64,
+                                            "replacements": [{"old_text": "Door", "new_text": "Gate"}]}], expected_root=A),
         "move_path#source": lambda: fs.move_path(target, str(a / "Moved.kt"), expected_root=A),
         "move_path#destination": lambda: fs.move_path(str(door(a)), str(b / "Moved.kt"), expected_root=A),
         "delete_path": lambda: fs.delete_path(target, expected_root=A),
         "git_status": lambda: fs.git_status(B, expected_root=A),
         "run_command": lambda: fs.run_command("echo hi", cwd=B, expected_root=A),
+        "start_command": lambda: fs.start_command("echo hi", cwd=B, expected_root=A),
+        "validate_python": lambda: fs.validate_python(B, "python", "pytest", [target], expected_root=A),
+        "validate_dotnet": lambda: fs.validate_dotnet(target, "dotnet", "build", expected_root=A),
+        "start_validation#files": lambda: fs.start_validation("python", B, "python", "pytest", [target], expected_root=A),
+        "start_validation#kotlin": lambda: kt.start_validation("compile", B, expected_root=A),
         "readiness#files": lambda: fs.readiness(expected_root=A, path=B),
         "project_info": lambda: kt.project_info(B, expected_root=A),
         "gradle_tasks": lambda: kt.gradle_tasks(None, B, expected_root=A),
@@ -105,7 +112,9 @@ def test_every_registered_tool_is_covered_by_the_wrong_worktree_test(worktrees):
 
     covered = {name.split("#")[0] for name in _wrong_target_calls(*worktrees)}
     registered = set(fs.ops.registered) | set(kt.ops.registered)
-    assert registered <= covered, registered - covered
+    # Handle-scoped jobs and partial batches have dedicated rejection tests below.
+    separate = {"read_files", "job_status", "job_output", "job_result", "cancel_job", "read_artifact"}
+    assert registered <= covered | separate, registered - covered - separate
 
 
 def test_backend_that_resolves_the_other_worktree_is_rejected(worktrees, launches, effects, monkeypatch):
@@ -376,8 +385,14 @@ def test_protected_files_and_aliases_are_never_opened(worktrees, effects, monkey
     monkeypatch.setattr(os.path, "realpath", mocked_realpath)
     real_iter = common.iter_files
     listing = lambda root, include_ignored=False: [*real_iter(root, include_ignored), secret, alias]  # noqa: E731
-    monkeypatch.setattr(fs, "iter_files", listing)
     monkeypatch.setattr(kt, "iter_files", listing)
+    real_bounded = fs.bounded_entries
+
+    def bounded_listing(*args):
+        yield from real_bounded(*args)
+        yield secret, 1, False
+        yield alias, 1, False
+    monkeypatch.setattr(fs, "bounded_entries", bounded_listing)
     effects.events.clear()
 
     for spelling in (secret, a / "LOCAL.PROPERTIES", a / "local.properties.", a / "local.properties::$DATA", alias, short):
@@ -515,17 +530,16 @@ def test_handlers_cannot_be_registered_or_reach_helpers_without_checks(worktrees
 
 def test_tools_reject_through_the_sdk_error_mechanism(worktrees):
     """Called the way a client calls them: the SDK marks the result as an error."""
-    from mcp.server.fastmcp.exceptions import ToolError as SdkToolError
-
     from ide_mcp import files_server as fs
 
     a, b = worktrees
-    with pytest.raises(SdkToolError, match=r"\[outcome=blocked reason=target_mismatch "):
-        run(fs.mcp.call_tool("read_file", {"path": str(door(b)), "expected_root": str(a)}))
-    with pytest.raises(SdkToolError, match=r"\[outcome=blocked reason=missing_scope "):
-        run(fs.mcp.call_tool("read_file", {"path": str(door(a))}))
-    content, _structured = run(fs.mcp.call_tool("read_file", {"path": str(door(a)), "expected_root": str(a)}))
-    assert "class Door" in content[0].text
+    for args, reason in (({"path": str(door(b)), "expected_root": str(a)}, "target_mismatch"),
+                         ({"path": str(door(a))}, "missing_scope")):
+        response = run(fs.mcp.call_tool("read_file", args))
+        assert response.isError and response.structuredContent["reason"] == reason
+        assert response.content[0].text.startswith(f"[outcome=blocked reason={reason} ")
+    response = run(fs.mcp.call_tool("read_file", {"path": str(door(a)), "expected_root": str(a)}))
+    assert not response.isError and "class Door" in response.content[0].text
 
 
 # ----------------------------------------------------------------------------- scope and permission

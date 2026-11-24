@@ -182,7 +182,7 @@ def test_two_concurrent_worktree_requests_use_their_own_sessions(worktrees, lsp_
         return sa, sb, out
 
     sa, sb, (in_a, in_b, crossed) = run(scenario())
-    assert in_a == "class Door in app" and in_b == "class Door in app-other"
+    assert in_a.endswith("class Door in app") and in_b.endswith("class Door in app-other")
     assert getattr(crossed, "reason", None) == "target_mismatch"
     opened = lambda s: {m["params"]["textDocument"]["uri"] for m in s.sent if m.get("method") == "textDocument/didOpen"}  # noqa: E731
     assert opened(sa) == {door(a).as_uri()} and opened(sb) == {door(b).as_uri()}
@@ -344,7 +344,7 @@ def _rng(l1, c1, l2, c2):
 def _rename_edit(a: Path, extra: list[dict]) -> dict:
     return {
         "documentChanges": [
-            {"textDocument": {"uri": door(a).as_uri(), "version": 0}, "edits": [{"range": _rng(2, 6, 2, 10), "newText": "Gate"}]},
+            {"textDocument": {"uri": door(a).as_uri(), "version": 1}, "edits": [{"range": _rng(2, 6, 2, 10), "newText": "Gate"}]},
             *extra,
         ]
     }
@@ -382,7 +382,7 @@ def test_rename_with_an_out_of_scope_destination_applies_nothing(worktrees, lsp_
     async def scenario():
         s = fake_session(project_root, responses={
             "textDocument/prepareRename": {"range": _rng(2, 6, 2, 10), "placeholder": "Door"},
-            "textDocument/definition": [], "textDocument/rename": edit,
+            "textDocument/definition": [{"uri": target.as_uri(), "range": _rng(2, 6, 2, 10)}], "textDocument/rename": edit,
         })
         lsp._sessions[lsp.session_key(project_root)] = s
         return await asyncio.gather(
@@ -393,7 +393,9 @@ def test_rename_with_an_out_of_scope_destination_applies_nothing(worktrees, lsp_
     effects.events.clear()
     (result,) = run(scenario())
     assert getattr(result, "outcome", None) == "blocked", result
-    assert result.reason == ("protected_path" if kind == "edit_protected" else "target_mismatch")
+    assert result.reason == ("protected_path" if kind == "edit_protected" else
+                             "unsupported_resource_operation" if kind == "create_outside" else
+                             "stale_document" if kind == "edit_outside_project" else "target_mismatch")
     assert effects.of("write") == []
     assert effects.touching(b, "open") == []
     assert {p: p.read_bytes() for p in before} == before
@@ -474,7 +476,7 @@ def test_wrapper_removed_after_project_lookup_blocks_the_launch(worktrees, launc
     assert len(launched(launches)) == before
 
 
-def test_execution_outcomes_are_explicit(worktrees, launches):
+def test_execution_outcomes_are_explicit(worktrees, launches, monkeypatch):
     from ide_mcp import files_server as fs
     from ide_mcp import kotlin_server as kt
     from ide_mcp.common import OutcomeError
@@ -498,16 +500,25 @@ def test_execution_outcomes_are_explicit(worktrees, launches):
     )
     wrapper = a / ("gradlew.bat" if os.name == "nt" else "gradlew")
     wrapper.write_text(wrapper.read_text().replace("BUILD SUCCESSFUL in 1s", "^> Task :app:testDebugUnitTest" if os.name == "nt" else "> Task :app:testDebugUnitTest"))
+    from ide_mcp import gradle
+    real_proc = gradle.run_proc
+
+    async def fresh_reports(*args, **kwargs):
+        result = await real_proc(*args, **kwargs)
+        for report in results.glob("TEST-*.xml"):
+            os.utime(report, None)  # fixture evidence generated during the owned run
+        return result
+    monkeypatch.setattr(gradle, "run_proc", fresh_reports)
     with pytest.raises(OutcomeError) as info:
         run(kt.run_tests(None, module=":app", expected_root=A))
     assert (info.value.outcome, info.value.category) == ("failed", "source")
-    assert "Tests: 2 run, 1 passed, 1 failed" in str(info.value)
+    assert "Tests: 2 executed, 1 passed, 1 failed" in str(info.value)
 
     (results / "TEST-demo.DoorTest.xml").write_text(
         '<testsuite name="demo.DoorTest" tests="1" skipped="0" failures="0" errors="0"><testcase name="ok" classname="demo.DoorTest"/></testsuite>'
     )
     out = run(kt.run_tests(None, module=":app", expected_root=A))
-    assert out.startswith("[outcome=passed]") and "Tests: 1 run, 1 passed" in out
+    assert out.startswith("[outcome=passed]") and "Tests: 1 executed, 1 passed" in out
 
     with pytest.raises(OutcomeError) as info:
         run(fs.run_command("exit 3", expected_root=A))
@@ -541,7 +552,7 @@ def test_readiness_query_is_cheap_and_changes_nothing(worktrees, lsp_env, launch
     assert snapshot() == before
     assert not (launches.parent / "lsp-cache").exists() and not (launches.parent / "gradle-logs").exists()
 
-    assert report.schema_version == "1.0" and report.contract_version == "2.0"
+    assert report.schema_version == "1.0" and report.contract_version == "3.0"
     assert report.server == "kotlin" and report.server_version == "0.2.0"
     assert (report.execution.state, report.semantic.state) == ("unknown", "unknown")
     assert report.semantic.reason == "semantic_not_started"

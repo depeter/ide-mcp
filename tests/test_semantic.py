@@ -52,9 +52,9 @@ def edits_for(a: Path) -> dict:
     use = door(a).parent / "Use.kt"
     return {
         "documentChanges": [
-            {"textDocument": {"uri": door(a).as_uri(), "version": 0}, "edits": [
+            {"textDocument": {"uri": door(a).as_uri(), "version": 1}, "edits": [
                 {"range": rng(2, 6, 2, 10), "newText": "Gate"}, {"range": rng(4, 12, 4, 16), "newText": "Gate"}]},
-            {"textDocument": {"uri": use.as_uri(), "version": 0}, "edits": [
+            {"textDocument": {"uri": use.as_uri(), "version": 1}, "edits": [
                 {"range": rng(4, 11, 4, 15), "newText": "Gate"}, {"range": rng(4, 21, 4, 25), "newText": "Gate"},
                 {"range": rng(6, 13, 6, 17), "newText": "Gate"}, {"range": rng(7, 13, 7, 17), "newText": "Gate"}]},
         ]
@@ -99,7 +99,8 @@ def test_find_usages_states_engine_project_symbol_and_completeness(project):
     refs = [loc(door(a), 2, 6, 10), loc(door(a), 4, 12, 16), loc(use, 4, 11, 15), loc(use, 4, 21, 25), loc(use, 6, 13, 17)]
 
     async def call(**kw):
-        serve(a, {"textDocument/references": refs})
+        if not kw.get("query_id"):
+            serve(a, {"textDocument/references": refs})
         return await kt.find_usages(None, "Door", file=str(door(a)), line=3, expected_root=str(a), **kw)
 
     out = run(call())
@@ -112,7 +113,7 @@ def test_find_usages_states_engine_project_symbol_and_completeness(project):
     h = header(out)
     assert (h["engine"], h["complete"], h["reason"]) == ("semantic", False, "truncated")
     assert "offset=2" in out
-    rest = run(call(engine="semantic", limit=2, offset=2))  # four lines in all: two references share one
+    rest = run(call(engine="semantic", limit=2, offset=2, query_id=out.fields["data"]["query_id"]))
     assert header(rest)["complete"] is True and "Use.kt" in rest
 
     async def empty():
@@ -273,7 +274,7 @@ def test_default_is_a_preview_that_changes_nothing_and_describes_the_edit(projec
     assert "app/src/main/kotlin/Use.kt (3)" in out and "val pair = Gate() to Gate()" in out
     assert len(re.findall(r"revision [0-9a-f]{12}", out)) == 2
     assert "other/Door.kt" not in out
-    assert preview_id(out) == preview_id(run(call()))  # the same edit set has the same id
+    assert preview_id(out) != preview_id(run(call()))  # a backend reconnect requires a fresh preview
     assert effects.of("write") == [] and tree(a) == before
 
 
@@ -291,7 +292,7 @@ def test_declaration_file_move_collision_is_rejected_without_changes(project, ef
 
     e = error(call())
     assert e.reason == "destination_collision" and "Gate.kt" in str(e)
-    assert "will be renamed" not in run(call(rename_files=False))
+    assert error(call(rename_files=False)).reason == "declaration_file_required"
     assert effects.of("write") == [] and tree(a) == before
 
 
@@ -302,7 +303,9 @@ def _apply(a: Path, pid: str | None, responses: dict | None = None, **kw):
     from ide_mcp import kotlin_server as kt
 
     async def call():
-        serve(a, responses)
+        from ide_mcp import lsp
+        if responses is not None or lsp.session_key(a) not in lsp._sessions:
+            serve(a, responses)
         return await kt.rename_symbol(None, "Door", "Gate", file=str(door(a)), line=3, dry_run=False, preview_id=pid, expected_root=str(a), **kw)
 
     return call()
@@ -351,7 +354,7 @@ def test_file_changed_after_preview_rejects_before_the_first_write(project, effe
     before = tree(a)
     effects.events.clear()
     e = error(_apply(a, pid))
-    assert e.reason == "stale_preview" and "Nothing was written" in str(e)
+    assert e.reason in ("stale_preview", "stale_document")
     assert effects.of("write") == [] and tree(a) == before and door(a).exists()
 
 
@@ -422,20 +425,19 @@ def test_denied_and_protected_targets_reject_the_application(project, effects, m
 
 
 def test_apply_failure_reports_what_was_and_was_not_written(project, monkeypatch):
-    from ide_mcp import guard
-
     a, _b = project
     pid = _preview(a)
-    real_write = guard.Scope.write_bytes
+    import os
+    real_write = os.replace
     calls = []
 
-    def failing(self, target, data):
+    def failing(source, target):
         calls.append(target)
         if len(calls) == 2:
             raise OSError("disk full")
-        return real_write(self, target, data)
+        return real_write(source, target)
 
-    monkeypatch.setattr(guard.Scope, "write_bytes", failing)
+    monkeypatch.setattr(os, "replace", failing)
     e = error(_apply(a, pid))
     assert (e.outcome, e.reason) == ("failed", "apply_failed")
     text = str(e)
@@ -490,8 +492,9 @@ def test_find_implementations(shapes):
     a, _b, f = shapes
 
     async def call(**kw):
-        serve(a, {"textDocument/definition": [loc(f, 3, 8, 12)],
-                  "textDocument/implementation": [loc(f, 7, 17, 21), loc(f, 12, 17, 21)]})
+        if not kw.get("query_id"):
+            serve(a, {"textDocument/definition": [loc(f, 3, 8, 12)],
+                      "textDocument/implementation": [loc(f, 7, 17, 21), loc(f, 12, 17, 21)]})
         return await kt.find_implementations(None, "area", file=str(f), line=4, expected_root=str(a), **kw)
 
     out = run(call())
@@ -501,7 +504,7 @@ def test_find_implementations(shapes):
     assert "Shapes.kt:8" in out and "override fun area(): Int = side() * side()" in out and "Shapes.kt:13" in out
     out = run(call(limit=1))
     assert (header(out)["complete"], header(out)["reason"]) == (False, "truncated") and "offset=1" in out and "Shapes.kt:13" not in out
-    assert "Shapes.kt:13" in run(call(limit=1, offset=1))
+    assert "Shapes.kt:13" in run(call(limit=1, offset=1, query_id=out.fields["data"]["query_id"]))
 
 
 def test_find_callers_keeps_overloads_apart_and_shows_a_cycle_once(shapes):

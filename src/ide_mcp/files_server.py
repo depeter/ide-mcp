@@ -4,28 +4,35 @@ project required."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import difflib
+import hashlib
+import io
+import json
 import os
 import re
 import shutil
 import sys
+from itertools import pairwise
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import BaseModel, Field
 
-from . import guard
+from . import execution, guard, validation
 from .common import (
     WINDOWS,
     Blocked,
+    ScanState,
     ToolError,
     active,
     allowed_roots,
+    bounded_entries,
     clip,
     glob_matcher,
     is_link,
-    iter_files,
     real,
     rel,
     run_proc,
@@ -53,11 +60,18 @@ mcp = FastMCP(
         "Search and listing tools take a `root` directory and honour .gitignore inside git "
         "repositories; elsewhere they skip build and cache directories. Pass include_ignored=true "
         "to look inside those too.\n"
-        "To edit: read_file, then replace_text with enough surrounding text to match exactly once. "
-        "Use create_file for new files or whole-file rewrites (overwrite=true)."
+        "Request contract 3.0 returns legacy text and structured OperationResult schema 1.0. "
+        "Batch item failures retain successful items but set isError=true. Read with "
+        "include_revision=true, then pass expected_revision to replace_text or an existing-file "
+        "create_file(overwrite=true). edit_files previews exact unique snippets and requires the "
+        "complete reviewed preview_id to apply. Reads and traversal have explicit work bounds; "
+        "incomplete output is not proof of absence. Shell execution is not a filesystem sandbox. "
+        "start_command and start_validation use shared scoped jobs; poll job_status/job_output "
+        "and retrieve job_result. Only confirmed owned termination is final."
     ),
 )
 ops = guard.Operations(mcp)
+jobs = execution.register_jobs(ops)
 
 READ = ToolAnnotations(readOnlyHint=True)
 ACT = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
@@ -65,6 +79,9 @@ DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 
 MAX_SEARCH_FILE_BYTES = 2_000_000
 MAX_LINE = 300
+MAX_READ_WORK = 2_000_000
+MAX_EDIT_BYTES = 8_000_000
+MAX_BATCH_OUTPUT = 120_000
 
 FilePath = Annotated[str, Field(description="Absolute path (or ~/...) of the file, inside expected_root.")]
 Root = Annotated[
@@ -97,6 +114,72 @@ def _write_atomic(p: Path, text: str) -> None:
     active().write_bytes(p, text.encode("utf-8"))
 
 
+def _decode_bytes(data: bytes, encoding: str | None = None) -> tuple[str, str, bytes]:
+    if b"\0" in data:
+        raise ToolError("Binary and UTF-16 files are not supported.")
+    if encoding not in (None, "utf-8", "cp1252"):
+        raise ToolError("Supported encodings are utf-8 and explicitly selected cp1252.")
+    bom = b"\xef\xbb\xbf" if data.startswith(b"\xef\xbb\xbf") else b""
+    chosen = encoding or "utf-8"
+    if bom and chosen != "utf-8":
+        raise ToolError("The UTF-8 BOM conflicts with the requested encoding.")
+    try:
+        return data[len(bom):].decode(chosen), chosen, bom
+    except UnicodeError:
+        raise ToolError("Unsupported text encoding. Select cp1252 explicitly for Windows legacy text.") from None
+
+
+def _revision_required(value: str | None) -> str:
+    if value is None or not re.fullmatch(r"[0-9a-f]{64}|-", value):
+        raise Blocked("revision_required", "expected_revision is required. Obtain it with read_file(include_revision=true).", "input")
+    return value
+
+
+def _range(path: str, start_line: int, max_lines: int, line_numbers: bool,
+           include_revision: bool = False, encoding: str | None = None, output_limit: int = MAX_BATCH_OUTPUT) -> dict[str, Any]:
+    scope = active()
+    p = scope.file(path)
+    if start_line < 1 or max_lines < 1 or max_lines > 10_000:
+        raise ToolError("Invalid line range.")
+    revision_bytes = scope.read_bytes(p, MAX_EDIT_BYTES) if include_revision else None
+    lines, consumed, eof, returned = [], 0, False, 0
+    with (io.BytesIO(revision_bytes) if revision_bytes is not None else scope.open_read(p)) as f:
+        for index in range(1, start_line + max_lines):
+            raw = f.readline(MAX_READ_WORK - consumed + 1)
+            consumed += len(raw)
+            if consumed > MAX_READ_WORK:
+                raise guard.FileTooLarge("The requested range exceeds the 2 MB scan budget. Narrow the range.")
+            if not raw:
+                eof = True
+                break
+            text, _encoding, _bom = _decode_bytes(raw, encoding)
+            if index >= start_line:
+                if returned + len(text) > output_limit:
+                    break
+                lines.append(text.rstrip("\r\n"))
+                returned += len(text)
+        else:
+            eof = not f.read(1)
+    if not lines and not eof:
+        raise ToolError("The first requested line exceeds the output bound.")
+    if not lines and start_line > 1:
+        raise ToolError(f"start_line {start_line} is past the end of {p}.")
+    end = start_line + len(lines) - 1
+    content = "\n".join(lines)
+    numbered = _numbered(lines, start_line) if line_numbers and lines else content
+    item = {"path": str(p), "outcome": "passed", "start_line": start_line, "end_line": end,
+            "total_lines": end if eof else None, "content": content, "result": numbered,
+            "complete": eof, "continuation": None if eof else {"start_line": end + 1},
+            "scanned_bytes": consumed, "revision": None, "encoding": encoding or "utf-8"}
+    if include_revision:
+        assert revision_bytes is not None
+        data = revision_bytes
+        _text, chosen, bom = _decode_bytes(data, encoding)
+        item.update(revision=hashlib.sha256(data).hexdigest(), encoding=chosen,
+                    bom=bool(bom), revision_hashed_bytes=len(data))
+    return item
+
+
 def _numbered(lines: list[str], first: int) -> str:
     width = len(str(first + len(lines) - 1))
     return "\n".join(f"{first + i:>{width}}\t{line}" for i, line in enumerate(lines))
@@ -117,23 +200,59 @@ async def read_file(
     max_lines: Annotated[int, Field(description="Maximum number of lines to return.", ge=1, le=10_000)] = 2000,
     line_numbers: Annotated[bool, Field(description="Prefix each line with its line number.")] = True,
     expected_root: ExpectedRoot = None,
+    include_revision: bool = False,
+    encoding: str | None = None,
 ) -> str:
-    """Read a text file. Returns the requested line range with line numbers and says how many
-    lines the file has, so you can page through large files with start_line."""
-    p = _existing_file(path)
-    lines = (await asyncio.to_thread(_decode, p)).splitlines()
-    total = len(lines)
-    if total == 0:
-        return f"{p} is empty."
-    if start_line > total:
-        raise ToolError(f"start_line {start_line} is past the end of {p} ({total} lines).")
-    chunk = lines[start_line - 1 : start_line - 1 + max_lines]
-    end = start_line + len(chunk) - 1
-    body = _numbered(chunk, start_line) if line_numbers else "\n".join(chunk)
-    header = f"{p} (lines {start_line}-{end} of {total})"
-    if end < total:
-        header += f"; continue with start_line={end + 1}"
-    return header + "\n" + clip(body, 120_000, keep="head")
+    """Read a bounded range. Total lines stay unknown until EOF. Opt-in revision hashes at most 8 MB."""
+    item = await asyncio.to_thread(_range, path, start_line, max_lines, line_numbers, include_revision, encoding)
+    header = f"{item['path']} (lines {start_line}-{item['end_line']} of {item['total_lines'] if item['total_lines'] is not None else 'unknown'})"
+    if item["continuation"]:
+        header += f"; continue with start_line={item['continuation']['start_line']}"
+    if item["revision"]:
+        header += f" [revision {item['revision']}]"
+    return guard.result(header + "\n" + item["result"], complete=item["complete"],
+                        incomplete_reason=None if item["complete"] else "range_limited",
+                        continuation=item["continuation"], data=item)
+
+
+class ReadRange(BaseModel):
+    path: str
+    start_line: int = Field(1, ge=1)
+    max_lines: int = Field(200, ge=1, le=10_000)
+    include_revision: bool = False
+    encoding: str | None = None
+
+
+@ops.tool(kind="file", needs=(TARGET,), annotations=READ)
+async def read_files(items: Annotated[list[ReadRange], Field(min_length=1, max_length=32)],
+                     expected_root: ExpectedRoot = None) -> str:
+    """Read up to 32 explicit ranges. Return independent item errors and at most 120,000 content characters."""
+    if not 1 <= len(items) <= 32:
+        raise ToolError("A batch read requires 1–32 items.")
+    results, remaining, seen = [], MAX_BATCH_OUTPUT, set()
+    for raw in items:
+        item = ReadRange.model_validate(raw)
+        try:
+            key = (str(active().check(item.path)), item.start_line, item.max_lines)
+            if key in seen:
+                raise ToolError("Duplicate range item.")
+            seen.add(key)
+            if remaining <= 0:
+                raise ToolError("Aggregate output limit reached; request the remaining items separately.")
+            value = await asyncio.to_thread(_range, item.path, item.start_line, item.max_lines, True,
+                                            item.include_revision, item.encoding, remaining)
+            remaining -= len(value["content"])
+            results.append(value)
+        except (ToolError, OSError) as e:
+            results.append({"path": item.path, "outcome": getattr(e, "outcome", "failed"),
+                            "reason": getattr(e, "reason", "read_failed"), "error": str(e)})
+    rejected = any(r["outcome"] != "passed" for r in results)
+    complete = not rejected and all(r["complete"] for r in results)
+    text = "\n\n".join(f"{r['path']}\n{r.get('result', r.get('error', ''))}" for r in results)
+    return guard.result(text, outcome="failed" if rejected else "passed", complete=complete,
+                        reason="partial_items" if rejected else None,
+                        incomplete_reason=None if complete else "partial_items" if rejected else "range_limited",
+                        data={"items": results, "content_limit": MAX_BATCH_OUTPUT})
 
 
 @ops.tool(kind="file", needs=(TARGET,), annotations=READ)
@@ -142,49 +261,27 @@ async def list_directory_tree(
     max_depth: Annotated[int, Field(description="How many directory levels to expand.", ge=1, le=10)] = 3,
     include_ignored: IncludeIgnored = False,
     expected_root: ExpectedRoot = None,
+    limit: Annotated[int, Field(ge=1, le=5000)] = 500,
+    work_limit: Annotated[int, Field(ge=1, le=100_000)] = 10_000,
 ) -> str:
-    """Show a directory as an indented tree. Directories deeper than max_depth are collapsed to
-    a file count. Git-ignored files and build output are left out unless include_ignored."""
+    """List visible entries only. Do not descend beyond max_depth or invent recursive totals."""
     root = active().dir(path)
 
     def build() -> str:
-        tree: dict = {}
-        files = iter_files(root, include_ignored)
-        for f in files:
-            parts = Path(rel(f, root)).parts
-            node = tree
-            for part in parts[:-1]:
-                node = node.setdefault(part, {})
-            node.setdefault(parts[-1], None)
-
-        def count(node: dict) -> int:
-            return sum(1 if v is None else count(v) for v in node.values())
-
-        lines: list[str] = []
-        limit = 500
-
-        def walk(node: dict, depth: int) -> None:
-            dirs = sorted(k for k, v in node.items() if v is not None)
-            leaves = sorted(k for k, v in node.items() if v is None)
-            for name in dirs:
-                if len(lines) >= limit:
-                    return
-                child = node[name]
-                if depth >= max_depth:
-                    lines.append(f"{'  ' * depth}{name}/  ({count(child)} files)")
-                else:
-                    lines.append(f"{'  ' * depth}{name}/")
-                    walk(child, depth + 1)
-            for name in leaves:
-                if len(lines) >= limit:
-                    return
-                lines.append(f"{'  ' * depth}{name}")
-
-        walk(tree, 0)
-        out = f"{root}/  ({len(files)} files)\n" + "\n".join(lines)
-        if len(lines) >= limit:
-            out += f"\n[... stopped at {limit} entries; lower max_depth or list a subdirectory ...]"
-        return out
+        state, entries, lines = ScanState(), [], []
+        for p, depth, directory in bounded_entries(root, include_ignored, max_depth, work_limit, state):
+            if len(entries) >= limit:
+                state.complete, state.reason = False, "entry_limit"
+                break
+            collapsed = directory and depth == max_depth
+            entries.append({"path": rel(p, root), "directory": directory, "expanded": directory and not collapsed})
+            lines.append("  " * (depth - 1) + p.name + ("/ [unexpanded]" if collapsed else "/" if directory else ""))
+        return guard.result(f"{root}/\n" + "\n".join(lines), complete=state.complete,
+                            incomplete_reason=state.reason, data={
+                                "entries": entries, "visited_entries": state.visited,
+                                "skipped_entries": state.skipped, "max_depth": max_depth,
+                                "continuation_supported": False,
+                            })
 
     return await asyncio.to_thread(build)
 
@@ -205,6 +302,7 @@ async def find_files(
     include_ignored: IncludeIgnored = False,
     limit: Annotated[int, Field(description="Maximum number of paths to return.", ge=1, le=5000)] = 200,
     expected_root: ExpectedRoot = None,
+    work_limit: Annotated[int, Field(ge=1, le=100_000)] = 10_000,
 ) -> str:
     """Find files by glob and/or by a substring of the file name. Returns paths relative to
     root."""
@@ -212,23 +310,23 @@ async def find_files(
     match = glob_matcher(glob)
     needle = name_contains.lower() if name_contains else None
 
-    def scan() -> list[str]:
-        hits = []
-        for f in iter_files(base, include_ignored):
+    def scan() -> str:
+        hits, state = [], ScanState()
+        for f, _depth, directory in bounded_entries(base, include_ignored, 100, work_limit, state):
+            if directory:
+                continue
             r = rel(f, base)
             if needle and needle not in f.name.lower():
                 continue
             if match(r):
                 hits.append(r)
-        return sorted(hits)
-
-    hits = await asyncio.to_thread(scan)
-    if not hits:
-        return f"No files matched under {base}."
-    out = f"{len(hits)} file(s) under {base}:\n" + "\n".join(hits[:limit])
-    if len(hits) > limit:
-        out += f"\n[... {len(hits) - limit} more; narrow the pattern or raise limit ...]"
-    return out
+                if len(hits) >= limit:
+                    state.complete, state.reason = False, "result_limit"
+                    break
+        return guard.result(f"{len(hits)} file(s) found under {base}:\n" + "\n".join(hits),
+                            complete=state.complete, incomplete_reason=state.reason,
+                            data={"paths": hits, "visited_entries": state.visited, "continuation_supported": False})
+    return await asyncio.to_thread(scan)
 
 
 @ops.tool(kind="file", needs=(TARGET,), annotations=READ)
@@ -244,6 +342,7 @@ async def search_in_files(
     include_ignored: IncludeIgnored = False,
     limit: Annotated[int, Field(description="Maximum number of matching lines to return.", ge=1, le=2000)] = 100,
     expected_root: ExpectedRoot = None,
+    work_limit: Annotated[int, Field(ge=1, le=100_000)] = 10_000,
 ) -> str:
     """Search file contents under root for text or a regex. Results are grouped by file with
     line numbers. Binary files and files over 2 MB are skipped; protected files (*.properties)
@@ -256,23 +355,33 @@ async def search_in_files(
         raise ToolError(f"Invalid regular expression: {e}") from None
     match = glob_matcher(file_glob)
 
-    def scan() -> tuple[list[str], int, int, int, dict[str, int]]:
+    def scan() -> tuple[list[str], int, int, int, dict[str, int], ScanState]:
         out: list[str] = []
         shown = total = searched = 0
         refused: dict[str, int] = {}
-        for f in sorted(iter_files(base, include_ignored)):
+        state = ScanState()
+        scanned_bytes = 0
+        for f, _depth, directory in bounded_entries(base, include_ignored, 100, work_limit, state):
+            if directory:
+                continue
+            if shown >= limit or scanned_bytes >= 20_000_000:
+                state.complete, state.reason = False, "search_limit"
+                break
             r = rel(f, base)
             if not match(r):
                 continue
             try:
-                data = scope.read_bytes(f, MAX_SEARCH_FILE_BYTES)
+                data = scope.read_bytes(f, min(MAX_SEARCH_FILE_BYTES, 20_000_000 - scanned_bytes))
+                scanned_bytes += len(data)
                 if b"\0" in data[:8192]:
+                    refused["binary"] = refused.get("binary", 0) + 1
                     continue
-                lines = data.decode("utf-8", "replace").splitlines()
+                lines = data.decode("utf-8").splitlines()
             except Blocked as e:
                 refused[e.reason or "blocked"] = refused.get(e.reason or "blocked", 0) + 1
                 continue
-            except (OSError, ToolError):
+            except (OSError, ToolError, UnicodeError):
+                refused["unreadable_or_unsupported"] = refused.get("unreadable_or_unsupported", 0) + 1
                 continue
             searched += 1
             hit_idx = [i for i, line in enumerate(lines) if rx.search(line)]
@@ -292,20 +401,30 @@ async def search_in_files(
                     out.append("  ...")
                 out.append(f"  {j + 1}{':' if j in hits else '-'} {_short(lines[j])}")
                 prev = j
-        return out, shown, total, searched, refused
+        return out, shown, total, searched, refused, state
 
-    out, shown, total, searched, refused = await asyncio.to_thread(scan)
+    out, shown, total, searched, refused, state = await asyncio.to_thread(scan)
+    complete = state.complete and not refused and shown < limit
+    data = {"matching_lines": shown, "searched_files": searched, "skipped": dict(refused),
+            "visited_entries": state.visited, "continuation_supported": False}
     note = ""
     if n := refused.pop("protected_path", 0):
         note += f"\n[{n} protected file(s) were not opened]"
     if n := sum(refused.values()):
         note += f"\n[{n} file(s) resolve outside expected_root or changed while being opened, and were not read]"
     if not total:
-        return f"No matches in {searched} file(s) under {base}." + note
+        return guard.result(f"No matches in {searched} searched file(s) under {base}." + note,
+                            complete=complete, incomplete_reason=None if complete else state.reason or "skipped_files",
+                            data=data)
     header = f"{total} matching line(s) in {searched} searched file(s) under {base}"
     if total > shown:
         header += f"; showing the first {shown} (narrow with file_glob or raise limit)"
-    return clip(header + ":\n" + "\n".join(out), 60_000, keep="head") + note
+    text = header + ":\n" + "\n".join(out)
+    if len(text) > 60_000:
+        complete = False
+    return guard.result(clip(text, 60_000, keep="head") + note, complete=complete,
+                        incomplete_reason=None if complete else state.reason or "bounded_or_skipped",
+                        data=data)
 
 
 # ----------------------------------------------------------------------------- writing
@@ -317,6 +436,7 @@ async def create_file(
     text: Annotated[str, Field(description="Full contents of the file.")],
     overwrite: Annotated[bool, Field(description="Replace the file if it already exists.")] = False,
     expected_root: ExpectedRoot = None,
+    expected_revision: str | None = None,
 ) -> str:
     """Create a file with the given contents, creating parent directories as needed. Fails if
     the file exists unless overwrite=true."""
@@ -326,7 +446,12 @@ async def create_file(
     existed = p.exists()
     if existed and not overwrite:
         raise ToolError(f"{p} already exists. Pass overwrite=true to replace it, or use replace_text to edit it.")
-    await asyncio.to_thread(_write_atomic, p, text)
+    revision = _revision_required(expected_revision) if existed else "-"
+    if not existed and expected_revision not in (None, "-"):
+        raise ToolError("A new file requires expected_revision='-'.")
+    if not existed and text and not text.endswith("\n\n"):
+        text = text.rstrip("\r\n") + ("\r\n\r\n" if "\r\n" in text else "\n\n")
+    await asyncio.to_thread(active().write_bytes, p, text.encode("utf-8"), expected_revision=revision)
     return f"{'Overwrote' if existed else 'Created'} {p} ({len(text.splitlines())} lines)."
 
 
@@ -339,6 +464,8 @@ async def replace_text(
     regex: Annotated[bool, Field(description="Treat old_text as a Python regular expression (multi-line, ^/$ per line).")] = False,
     case_sensitive: bool = True,
     expected_root: ExpectedRoot = None,
+    expected_revision: str | None = None,
+    encoding: str | None = None,
 ) -> str:
     """Replace text in a file. By default old_text must occur exactly once, so include enough
     surrounding lines to make it unique; the error lists the lines of every match otherwise.
@@ -346,7 +473,8 @@ async def replace_text(
     p = _existing_file(path)
     if not old_text:
         raise ToolError("old_text must not be empty. Use create_file to write a whole file.")
-    content = await asyncio.to_thread(_decode, p)
+    data = await asyncio.to_thread(active().read_bytes, p, MAX_EDIT_BYTES)
+    content, chosen, bom = _decode_bytes(data, encoding)
     # Callers almost always send \n; keep a CRLF file CRLF.
     if "\r\n" in content and "\r\n" not in old_text:
         old_text = old_text.replace("\n", "\r\n") if not regex else old_text
@@ -375,8 +503,10 @@ async def replace_text(
     except (re.error, IndexError) as e:
         raise ToolError(f"Invalid replacement: {e}") from None
     if updated == content:
+        active().require_revision(p, _revision_required(expected_revision))
         return f"No change: the replacement is identical to the existing text in {p}."
-    await asyncio.to_thread(_write_atomic, p, updated)
+    await asyncio.to_thread(active().write_bytes, p, bom + updated.encode(chosen),
+                            expected_revision=_revision_required(expected_revision))
 
     first = line_of(matches[0].start())
     new_lines = updated.splitlines()
@@ -385,6 +515,98 @@ async def replace_text(
     hi = min(len(new_lines), first + span + 1)
     snippet = _numbered([_short(line) for line in new_lines[lo - 1 : hi]], lo) if new_lines else "(file is now empty)"
     return f"Replaced {len(matches)} occurrence(s) in {p}. Around line {first} it now reads:\n{clip(snippet, 4000, keep='head')}"
+
+
+class Replacement(BaseModel):
+    old_text: str = Field(min_length=1, max_length=120_000)
+    new_text: str = Field(max_length=120_000)
+
+
+class ExactEdit(BaseModel):
+    path: str
+    expected_revision: str
+    replacements: list[Replacement] = Field(min_length=1, max_length=100)
+    encoding: str | None = None
+
+
+@ops.tool(kind="file", needs=(TARGET,), annotations=DESTRUCTIVE)
+async def edit_files(edits: Annotated[list[ExactEdit], Field(min_length=1, max_length=32)],
+                     dry_run: bool = True, preview_id: str | None = None,
+                     expected_root: ExpectedRoot = None) -> str:
+    """Preview or apply unique exact snippets with content revisions. Preflight all files.
+
+    Apply requires the complete preview's ID. A partial failure retains and lists completed
+    writes. There is no multi-file atomicity or unconditional rollback.
+    """
+    if not 1 <= len(edits) <= 32:
+        raise ToolError("An exact-edit batch requires 1–32 items.")
+    scope, plans, seen, budget = active(), [], set(), 0
+    for raw in edits:
+        item = ExactEdit.model_validate(raw)
+        p = scope.file(item.path)
+        key = str(p).casefold() if WINDOWS else str(p)
+        if key in seen or any(os.path.samefile(p, q["path"]) for q in plans):
+            raise ToolError("Duplicate resolved edit path.")
+        seen.add(key)
+        scope.require_revision(p, _revision_required(item.expected_revision))
+        data = scope.read_bytes(p, MAX_EDIT_BYTES)
+        if hashlib.sha256(data).hexdigest() != item.expected_revision:
+            raise Blocked("stale_revision", f"{p} changed during edit preflight.", "input")
+        budget += len(data)
+        if budget > 16_000_000:
+            raise ToolError("The exact-edit batch exceeds its 16 MB byte budget.")
+        text, encoding, bom = _decode_bytes(data, item.encoding)
+        spans = []
+        for r in item.replacements:
+            count = text.count(r.old_text)
+            if count != 1:
+                raise ToolError(f"{p}: exact snippet matches {count} places; exactly one is required.")
+            start = text.index(r.old_text)
+            spans.append((start, start + len(r.old_text), r.new_text))
+        spans.sort()
+        if any(b[0] < a[1] for a, b in pairwise(spans)):
+            raise ToolError(f"{p}: overlapping replacements.")
+        updated = text
+        for start, end, replacement in reversed(spans):
+            updated = updated[:start] + replacement + updated[end:]
+        try:
+            payload = bom + updated.encode(encoding)
+        except UnicodeError:
+            raise ToolError(f"{p}: replacement cannot be encoded as {encoding}.") from None
+        diff = "".join(difflib.unified_diff(text.splitlines(keepends=True), updated.splitlines(keepends=True),
+                                          fromfile=str(p), tofile=str(p), n=2))
+        if sum(len(q["diff"]) for q in plans) + len(diff) > MAX_BATCH_OUTPUT:
+            raise Blocked("preview_too_large", "The full preview exceeds 120,000 characters. Split the edit batch.", "input")
+        plans.append({"path": p, "revision": item.expected_revision, "payload": payload, "diff": diff,
+                      "ranges": [{"start_line": text.count("\n", 0, s) + 1,
+                                  "end_line": text.count("\n", 0, e) + 1} for s, e, _r in spans]})
+    binding = [str(scope.ident), [(str(q["path"]), q["revision"], q["ranges"],
+                                 hashlib.sha256(q["payload"]).hexdigest()) for q in plans]]
+    digest = hashlib.sha256(json.dumps(binding).encode()).hexdigest()
+    public = [{"path": str(q["path"]), "expected_revision": q["revision"], "changed_ranges": q["ranges"],
+               "new_revision": hashlib.sha256(q["payload"]).hexdigest()} for q in plans]
+    if dry_run:
+        return guard.result("\n".join(q["diff"] for q in plans) + f"\npreview_id: {digest}",
+                            outcome="not_run", reason="dry_run", data={"preview_id": digest, "edits": public})
+    if preview_id != digest:
+        raise Blocked("stale_preview", "Apply requires the ID of this exact complete preview. Preview again.", "input")
+    for q in plans:
+        scope.require_revision(q["path"], q["revision"])
+    done = []
+    try:
+        with contextlib.ExitStack() as stack:
+            commits = [stack.enter_context(scope.stage_write(q["path"], q["payload"],
+                                                              expected_revision=q["revision"])) for q in plans]
+            for q, commit in zip(plans, commits):
+                commit()
+                done.append(str(q["path"]))
+    except (OSError, ToolError) as e:
+        return guard.result(f"Application failed: {e}. Written: {done}. No rollback was attempted.",
+                            outcome="failed", reason="apply_failed", category="environment", complete=False,
+                            incomplete_reason="partial_application",
+                            data={"written": done, "pending": [str(q["path"]) for q in plans if str(q["path"]) not in done],
+                                  "edits": public})
+    return guard.result("Applied the reviewed exact edits.", data={"written": done, "edits": public})
 
 
 @ops.tool(kind="file", needs=(TARGET,), annotations=DESTRUCTIVE)
@@ -519,6 +741,8 @@ def _check_command_targets(command: str, workdir: Path) -> None:
     directories in ways no inspection of its command line will see. The working directory is
     enforced; beyond that, only paths spelled out in the command are checked."""
     scope = active()
+    if re.search(r"""(?i)[^\s"';&|]+\.properties(?:[. :][^\s"';&|]*)?(?=$|[\s"';&|])""", command):
+        raise Blocked("protected_path", "The shell command names a protected file. Raw execution cannot bypass a denied file operation.")
     candidates = {m.group(0) for m in _COMMAND_PATH.finditer(command)}
     candidates |= {q for m in _QUOTED.finditer(command) for q in m.groups() if q and _COMMAND_PATH.match(q)}
     for raw in candidates:
@@ -572,9 +796,76 @@ async def run_command(
     _shell_started = True
     status = f"timed out after {timeout_sec}s and was killed" if r.timed_out else f"exit code {r.code}"
     text = f"[{status}] (cwd: {workdir})\n" + clip(r.output.rstrip("\n") or "(no output)")
-    if r.timed_out:
-        return guard.outcome("timed_out", text, category="unknown")
-    return guard.outcome("passed" if r.code == 0 else "failed", text, category=None if r.code == 0 else "unknown")
+    artifact = execution.save_artifact(r.output)
+    return guard.finish(guard.result(text, outcome="timed_out" if r.timed_out else "passed" if r.code == 0 else "failed",
+                        category=None if r.code == 0 else "unknown", complete=r.output_complete,
+                        incomplete_reason=None if r.output_complete else "output_limit",
+                        data={"executable": SHELL_ARGV[0], "exit_code": r.code, "artifacts": [artifact],
+                              "shell_confinement": "working_directory_only"}))
+
+
+@ops.tool(kind="execution", needs=(EXECUTION,), annotations=DESTRUCTIVE)
+async def start_command(command: str, cwd: str | None = None, timeout_sec: int = 120,
+                        expected_root: ExpectedRoot = None) -> str:
+    """Start one approved shell command. Shell execution is not a filesystem sandbox."""
+    root = active().launch_dir(cwd)
+    _check_command_targets(command, root)
+    if not 1 <= timeout_sec <= 3600:
+        raise ToolError("timeout_sec must be between 1 and 3600.")
+    job = jobs.start(lambda: run_command(command, cwd=str(root), timeout_sec=timeout_sec,
+                                         expected_root=expected_root))
+    return guard.result("Command queued.", complete=False, incomplete_reason="job_not_final",
+                        data={"job_id": job.id, "state": job.state})
+
+
+@ops.tool(kind="execution", needs=(TARGET, EXECUTION), annotations=ACT)
+async def validate_python(project: str, executable_path: str, check: str, files: list[str],
+                          filter: str | None = None, timeout_sec: int = 600,
+                          expected_root: ExpectedRoot = None) -> str:
+    """Run focused pytest, ruff or basedpyright using an explicitly selected Python interpreter."""
+    if not 1 <= timeout_sec <= 3600:
+        raise ToolError("timeout_sec must be between 1 and 3600.")
+    return guard.finish(await validation.validate_python(project, executable_path, check, files, filter, timeout_sec))
+
+
+@ops.tool(kind="execution", needs=(TARGET, EXECUTION), annotations=ACT)
+async def validate_dotnet(project: str, executable_path: str, check: str,
+                          filter: str | None = None, timeout_sec: int = 600,
+                          isolate_outputs: bool = False, output_root: str | None = None,
+                          expected_root: ExpectedRoot = None) -> str:
+    """Run an explicit .NET project build/test. Native .NET 8+ output isolation leaves the app alone."""
+    if not 1 <= timeout_sec <= 3600:
+        raise ToolError("timeout_sec must be between 1 and 3600.")
+    return guard.finish(await validation.validate_dotnet(project, executable_path, check, filter,
+                                                         timeout_sec, isolate_outputs, output_root))
+
+
+@ops.tool(kind="execution", needs=(TARGET, EXECUTION), annotations=ACT)
+async def start_validation(adapter: str, project: str, executable_path: str, check: str,
+                           files: list[str] | None = None, filter: str | None = None,
+                           timeout_sec: int = 600, isolate_outputs: bool = False,
+                           output_root: str | None = None, expected_root: ExpectedRoot = None) -> str:
+    """Start the same focused Python/.NET check as the synchronous adapter."""
+    active().check(project, protected=False)
+    if adapter not in ("python", "dotnet") or not 1 <= timeout_sec <= 3600:
+        raise ToolError("Select python or dotnet and a timeout from 1 to 3600 seconds.")
+    if adapter == "python":
+        if isolate_outputs or output_root:
+            raise ToolError("Output isolation parameters belong to the .NET adapter.")
+        validation.python_inputs(project, executable_path, check, files or [], filter)
+    else:
+        if files:
+            raise ToolError(".NET validation uses an explicit project, not Python file targets.")
+        validation.dotnet_inputs(project, executable_path, check, filter, output_root)
+    async def work():
+        if adapter == "python":
+            return await validate_python(project, executable_path, check, files or [], filter,
+                                         timeout_sec, expected_root=expected_root)
+        return await validate_dotnet(project, executable_path, check, filter, timeout_sec,
+                                     isolate_outputs, output_root, expected_root=expected_root)
+    job = jobs.start(work)
+    return guard.result("Validation queued.", complete=False, incomplete_reason="job_not_final",
+                        data={"job_id": job.id, "state": job.state})
 
 
 @ops.tool(kind="readiness", needs=(), annotations=READ, structured_output=True)

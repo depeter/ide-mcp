@@ -48,6 +48,7 @@ GRADLEW_BAT = """\
 @echo off
 echo %CD%^|%*>> "%IDE_MCP_TEST_LAUNCHES%"
 if "%2"=="tasks" type "%~dp0gradle-tasks.txt"
+if "%3"=="tasks" type "%~dp0gradle-tasks.txt"
 echo BUILD SUCCESSFUL in 1s
 """
 

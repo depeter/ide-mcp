@@ -11,9 +11,10 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .common import SKIP_DIRS, WINDOWS, Blocked, ToolError, active, android_sdk, clip, is_link, path_key, rel, resolve, run_proc
+from .execution import WorkspaceLease, save_artifact, source_identity
 
 SETTINGS = ("settings.gradle.kts", "settings.gradle")
 BUILD_FILES = ("build.gradle.kts", "build.gradle")
@@ -161,6 +162,11 @@ class GradleRun:
     log: Path | None
     timed_out: bool = False
     started: float = 0.0
+    test_summary: TestSummary | None = None
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
+    source_start: dict[str, Any] = field(default_factory=dict)
+    source_end: dict[str, Any] = field(default_factory=dict)
+    output_complete: bool = True
 
     @property
     def ok(self) -> bool:
@@ -206,7 +212,8 @@ def check_arguments(project: GradleProject, args: list[str]) -> None:
             raise Blocked("argument_redirect", f"Gradle option {option} is missing its path. Nothing was run.", "input")
         target = Path(os.path.expanduser(value))
         try:
-            scope.check(target if target.is_absolute() else project.root / target, protected=False)
+            scope.check(target if target.is_absolute() else project.root / target,
+                        protected=option in ("--settings-file", "--build-file", "--init-script", "-c", "-b", "-I"))
         except Blocked as e:
             if e.reason != "target_mismatch":
                 raise
@@ -251,16 +258,8 @@ def _gradle_env() -> dict[str, str]:
 
 
 def _save_log(project: GradleProject, args: list[str], output: str) -> Path | None:
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        name = f"{project.root.name}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"
-        path = LOG_DIR / name
-        path.write_text(f"$ gradle {' '.join(args)}   (in {project.root})\n\n{output}", encoding="utf-8")
-        for old in sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime)[:-KEEP_LOGS]:
-            old.unlink(missing_ok=True)
-        return path
-    except OSError:
-        return None
+    artifact = save_artifact(f"$ gradle {' '.join(args)}   (in {project.root})\n\n{output}")
+    return Path(artifact["path"]) if artifact["path"] else None
 
 
 async def run_gradle(
@@ -270,6 +269,7 @@ async def run_gradle(
     timeout: float = 900.0,
     on_line: Callable[[str], None] | None = None,
     save_log: bool = True,
+    report_dirs: list[tuple[str, Path]] | None = None,
 ) -> GradleRun:
     """Run Gradle in the project root. Invocations for the same build are serialised, since a
     second client would only sit waiting for the first one's lock anyway.
@@ -285,8 +285,10 @@ async def run_gradle(
     if state == "unavailable":
         raise Blocked(reason or "execution_unavailable", f"Gradle cannot be started for {project.root}: {detail}", "environment")
     lock = _locks.setdefault(project.root, asyncio.Lock())
-    async with lock:
+    async with lock, WorkspaceLease(project.root):
         started = time.time()
+        source_start = source_identity(project.root)
+        before = _test_files([p for _task, p in report_dirs or []]) if report_dirs else {}
         r = await run_proc(
             [*project.launcher, "--console=plain", *args],
             cwd=project.root,
@@ -296,8 +298,38 @@ async def run_gradle(
         )
         _launched.add(path_key(project.root))  # it started, whatever the build's result
         seconds = time.time() - started
-    log = _save_log(project, args, r.output) if save_log else None
-    return GradleRun(project, args, r.code, r.output, seconds, log, r.timed_out, started)
+        summary = None
+        if report_dirs is not None:
+            summary = TestSummary()
+            for task, directory in report_dirs:
+                marker = re.search(rf"^> Task {re.escape(task)}(?: ([A-Z-]+))?$", r.output, re.MULTILINE)
+                if marker is None or marker.group(1) in ("SKIPPED", "NO-SOURCE"):
+                    summary.complete = False
+                    summary.problems.append(f"{task}: no verified current test execution")
+                    continue
+                after = _test_files([directory])
+                fresh = {path: data for path, (stamp, data) in after.items()
+                         if path not in before or before[path] != (stamp, data)}
+                reused = marker.group(1) in ("UP-TO-DATE", "FROM-CACHE")
+                parsed = _parse_test_files({p: data for p, (_stamp, data) in after.items()} if reused else fresh)
+                if reused:
+                    summary.reused += parsed.executed
+                    if parsed.failed:
+                        summary.problems.append(f"{task}: reused evidence includes failures")
+                    summary.complete = False
+                else:
+                    summary.total += parsed.total
+                    summary.skipped += parsed.skipped
+                    summary.failed += parsed.failed
+                    summary.failures += parsed.failures
+                    summary.suites += parsed.suites
+                    summary.complete = summary.complete and parsed.complete
+                    summary.problems += parsed.problems
+        artifact = save_artifact(f"$ gradle {' '.join(args)}\n\n{r.output}") if save_log else None
+        source_end = source_identity(project.root)
+        log = Path(artifact["path"]) if artifact and artifact["path"] else None
+    return GradleRun(project, args, r.code, r.output, seconds, log, r.timed_out, started,
+                     summary, [artifact] if artifact else [], source_start, source_end, r.output_complete)
 
 
 # ----------------------------------------------------------------------------- tasks
@@ -506,8 +538,8 @@ def format_report(
     errors, warnings = rep.errors, rep.warnings
     hidden = 0
     if only_files is not None:  # a set of path_key() values
-        hidden = sum(1 for d in errors if d.key not in only_files)
-        errors = [d for d in errors if d.key in only_files]
+        # Keep sibling errors: the selected file is a focus, not a build boundary.
+        errors = sorted(errors, key=lambda d: d.key not in only_files)
         warnings = [d for d in warnings if d.key in only_files]
 
     if run.timed_out:
@@ -555,12 +587,21 @@ class TestSummary:
     skipped: int = 0
     failures: list[str] = field(default_factory=list)
     suites: int = 0
+    complete: bool = True
+    problems: list[str] = field(default_factory=list)
+    reused: int = 0
+
+    @property
+    def executed(self) -> int:
+        return self.total - self.skipped
 
     def render(self, max_failures: int = 25) -> str:
         if not self.suites:
-            return "No test results were written (no tests matched, or the tasks were up to date and skipped)."
+            return f"No current-run test results: 0 executed; {self.reused} reused. " + "; ".join(self.problems)
         passed = self.total - self.failed - self.skipped
-        out = [f"Tests: {self.total} run, {passed} passed, {self.failed} failed, {self.skipped} skipped ({self.suites} classes)"]
+        out = [f"Tests: {self.executed} executed, {passed} passed, {self.failed} failed, {self.skipped} skipped ({self.suites} classes); {self.reused} reused"]
+        if not self.complete:
+            out.append("Incomplete reports: " + "; ".join(self.problems))
         for f in self.failures[:max_failures]:
             out.append("\n" + f)
         if len(self.failures) > max_failures:
@@ -587,22 +628,50 @@ def _trim_stack(text: str, keep: int = 10) -> str:
 def collect_tests(dirs: list[Path], since: float) -> TestSummary:
     """Summarise the JUnit XML reports under the given result directories that were written
     since `since` (0 for all)."""
-    scope = active()
-    summary = TestSummary()
+    files = _test_files(dirs)
+    return _parse_test_files({p: data for p, (stamp, data) in files.items() if stamp / 1_000_000_000 >= since})
+
+
+def _test_files(dirs: list[Path]) -> dict[Path, tuple[int, bytes]]:
+    scope, files, size = active(), {}, 0
     for results in dirs:
+        scope.check(results, protected=False)
         if not results.is_dir():
             continue
-        for xml in sorted(results.rglob("TEST-*.xml")):
+        for xml in results.rglob("TEST-*.xml"):
+            if len(files) >= 1000 or size >= 20_000_000:
+                raise Blocked("report_limit", "Test report capture exceeded its bounded file or byte limit.", "environment")
             try:
-                if xml.stat().st_mtime < since - 1:
-                    continue
-                suite = ET.fromstring(scope.read_bytes(xml))
-            except (OSError, ET.ParseError, ToolError):
-                continue
-            summary.suites += 1
-            summary.total += int(suite.get("tests", 0))
-            summary.skipped += int(suite.get("skipped", 0))
-            for case in suite.iter("testcase"):
+                data = scope.read_bytes(xml, 8_000_000)
+                files[xml] = (xml.stat().st_mtime_ns, data)
+                size += len(data)
+            except OSError:
+                files[xml] = (0, b"")
+    return files
+
+
+def _parse_test_files(files: dict[Path, bytes]) -> TestSummary:
+    summary = TestSummary()
+    if not files:
+        summary.complete = False
+        summary.problems.append("required reports missing or stale")
+    for xml, data in files.items():
+        try:
+            suite = ET.fromstring(data)
+            if suite.tag not in ("testsuite", "testsuites"):
+                raise ValueError("Invalid report root.")
+            cases = list(suite.iter("testcase"))
+            skipped = sum(c.find("skipped") is not None for c in cases)
+            summary.suites += len(list(suite.iter("testsuite")))
+            summary.total += len(cases)
+            summary.skipped += skipped
+            suites = [s for s in suite.iter("testsuite") if not s.findall("testsuite")]
+            if (sum(int(s.get("tests", len(s.findall("testcase")))) for s in suites) != len(cases) or
+                    sum(int(s.get("skipped", sum(c.find("skipped") is not None for c in s.findall("testcase"))))
+                        for s in suites) != skipped):
+                summary.complete = False
+                summary.problems.append(f"incomplete report counts: {xml.name}")
+            for case in cases:
                 bad = case.find("failure")
                 if bad is None:
                     bad = case.find("error")
@@ -614,4 +683,7 @@ def collect_tests(dirs: list[Path], since: float) -> TestSummary:
                 if message:
                     title += f": {clip(message[0], 400, keep='head')}"
                 summary.failures.append((title + "\n" + _trim_stack(bad.text or "")).rstrip())
+        except (ET.ParseError, ValueError, TypeError):
+            summary.complete = False
+            summary.problems.append(f"malformed report: {xml.name}")
     return summary

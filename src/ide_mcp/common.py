@@ -10,6 +10,7 @@ import signal
 import stat
 import subprocess
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -22,7 +23,7 @@ MAX_FILES = 200_000
 SKIP_DIRS = frozenset(
     {
         ".git", ".gradle", ".idea", ".kotlin", ".cxx", ".venv", "__pycache__", "node_modules",
-        "build", "out", "target", ".dart_tool", "Pods", ".pytest_cache",
+        "build", "out", "target", ".dart_tool", "Pods", ".pytest_cache", ".ide-mcp",
     }
 )
 
@@ -36,6 +37,7 @@ class ToolError(Exception):
 class OutcomeError(ToolError):
     """A tool failure that states its outcome. The message starts with a stable, parseable
     line: `[outcome=<outcome> reason=<code> category=<category>]`."""
+    fields: dict[str, Any] | None = None
 
     def __init__(self, outcome: str, message: str, *, category: str | None = None, reason: str | None = None):
         self.outcome, self.reason, self.detail = outcome, reason, message
@@ -55,6 +57,7 @@ class Blocked(OutcomeError):
 
 def clip(text: str, limit: int = MAX_OUTPUT, keep: Literal["both", "tail", "head"] = "both") -> str:
     """Bound output size so one noisy command can't flood the model's context."""
+    text = sanitise(text)
     if len(text) <= limit:
         return text
     omitted = len(text) - limit
@@ -64,6 +67,60 @@ def clip(text: str, limit: int = MAX_OUTPUT, keep: Literal["both", "tail", "head
         return text[:limit] + f"\n[... {omitted} more characters omitted ...]"
     half = limit // 2
     return text[:half] + f"\n[... {omitted} characters omitted ...]\n" + text[-half:]
+
+
+_CREDENTIAL = re.compile(
+    r"""(?im)(\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|authorization)\b["']?\s*[:=]\s*)"""
+    r"""(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n,;]+)"""
+)
+_PAYMENT = re.compile(
+    r"(?im)^.*(?:\b(?:PAN|track[ _-]?[12]|pin[ _-]?block|CVV|CVC|SRED)\b|"
+    r"%B[0-9]{12,19}\^|;[0-9]{12,19}=).*$"
+)
+_SECRET_KEY = re.compile(r"(?i)^(?:password|passwd|secret|api[_-]?key|access[_-]?token|authorization)$")
+_PAYMENT_KEY = re.compile(r"(?i)^(?:pan|track[ _-]?[12]|pin[ _-]?block|cvv|cvc|sred)$")
+_SECRET_ARG = re.compile(
+    r"""(?i)(--(?:password|passwd|secret|api[_-]?key|access[_-]?token|authorization)\s+)"""
+    r"""(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s]+)"""
+)
+_PENDING_SECRET = re.compile(
+    r"""(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|authorization)\b["']?\s*[:=]\s*$"""
+)
+
+
+def sanitise(text: str) -> str:
+    """Redact labelled credentials. Withhold recognised payment payload lines.
+
+    This is not certification of arbitrary payment traces. Unknown payment formats
+    must not be supplied to this general-purpose execution runner.
+    """
+    text = re.sub(r"(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+                  "[private key withheld]", text)
+    text = re.sub(r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@", r"\1[redacted]@", text)
+    text = _CREDENTIAL.sub(r"\1[redacted]", text)
+    text = _SECRET_ARG.sub(r"\1[redacted]", text)
+    text = re.sub(r"(?im)^.*\.properties(?:\s*[:=]\s+|:\d|\s+(?:content|value|line)\b).*$",
+                  lambda m: ((prefix[0] + " ") if (prefix := re.match(r"^\[outcome=[^]]+\]", m[0]))
+                             else "") + "[protected-file output withheld]", text)
+    return _PAYMENT.sub("[payment payload withheld]", text)
+
+
+def sanitise_value(value: Any) -> Any:
+    """Apply the same boundary to structured strings, not only the legacy text."""
+    if isinstance(value, str):
+        return sanitise(value)
+    if isinstance(value, dict):
+        return {sanitise(str(k)): "[redacted]" if _SECRET_KEY.fullmatch(str(k)) else
+                "[payment payload withheld]" if _PAYMENT_KEY.fullmatch(str(k)) else sanitise_value(v)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        result = []
+        hide_next = False
+        for v in value:
+            result.append("[redacted]" if hide_next else sanitise_value(v))
+            hide_next = isinstance(v, str) and _SECRET_KEY.fullmatch(v.removeprefix("--")) is not None
+        return result
+    return value
 
 
 # ----------------------------------------------------------------------------- paths
@@ -184,6 +241,7 @@ def protected_name(name: str) -> bool:
 # The operation a request is running, set by guard.Operations around each handler. A
 # ContextVar, so concurrent requests each see their own and worker threads inherit it.
 _ACTIVE: contextvars.ContextVar[Any] = contextvars.ContextVar("ide_mcp_operation", default=None)
+_OUTPUT_SINK: contextvars.ContextVar[Any] = contextvars.ContextVar("ide_mcp_output_sink", default=None)
 
 
 def active(need: str | None = None) -> Any:
@@ -289,6 +347,78 @@ def iter_files(root: Path, include_ignored: bool = False) -> list[Path]:
     return files[:MAX_FILES]
 
 
+def ignored_entries(root: Path, entries: list[Path]) -> set[str]:
+    """Ask Git about just the visible entries. Never enumerate descendants for counts."""
+    if worktree_root(root) is None:
+        return set()
+    try:
+        p = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "--stdin", "-z"],
+            input=b"\0".join(os.fsencode(str(e)) for e in entries) + b"\0",
+            capture_output=True, timeout=10, stdin=None, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise Blocked("ignore_policy_unavailable", "Git ignore policy could not be checked.", "environment") from None
+    if p.returncode not in (0, 1):
+        raise Blocked("ignore_policy_unavailable", "Git ignore policy could not be checked.", "environment")
+    return {path_key(os.fsdecode(e)) for e in p.stdout.split(b"\0") if e}
+
+
+@dataclass
+class ScanState:
+    visited: int = 0
+    complete: bool = True
+    reason: str | None = None
+    skipped: int = 0
+
+
+def bounded_entries(root: Path, include_ignored: bool, max_depth: int, work_limit: int,
+                    state: ScanState) -> Iterator[tuple[Path, int, bool]]:
+    """Depth-first visible entries. Bound collected directory metadata before sorting."""
+    scope = active()
+
+    def walk(here: Path, depth: int):
+        here = scope.dir(here)
+        remaining = work_limit - state.visited
+        if remaining <= 0:
+            state.complete, state.reason = False, "work_limit"
+            return
+        entries = []
+        try:
+            with os.scandir(here) as directory:
+                for e in directory:
+                    if len(entries) >= remaining:
+                        state.complete, state.reason = False, "work_limit"
+                        break
+                    entries.append(e)
+        except OSError:
+            state.complete, state.reason = False, "directory_unreadable"
+            return
+        state.visited += len(entries)
+        ignored = ignored_entries(root, [Path(e.path) for e in entries]) if not include_ignored else set()
+        for e in sorted(entries, key=lambda e: (not e.is_dir(follow_symlinks=False), e.name)):
+            p = Path(e.path)
+            if e.name == ".git" or (not include_ignored and
+                    (path_key(p) in ignored or (worktree_root(root) is None and e.name in SKIP_DIRS))):
+                continue
+            try:
+                p = scope.check(p, protected=False)
+            except Blocked:
+                state.skipped += 1
+                state.complete, state.reason = False, "rejected_entries"
+                continue
+            directory = e.is_dir(follow_symlinks=False)
+            yield p, depth, directory
+            if directory and depth < max_depth:
+                if is_link(p) or os.path.lexists(p / ".git"):
+                    state.skipped += 1
+                    state.complete, state.reason = False, "unexpanded_checkout_or_link"
+                else:
+                    yield from walk(p, depth + 1)
+
+    yield from walk(root, 1)
+
+
 def glob_to_regex(pattern: str) -> re.Pattern[str]:
     """Translate a glob with **, *, ?, [..] and {a,b} into a regex over forward-slash paths."""
     i, n, out, depth = 0, len(pattern), [], 0
@@ -350,6 +480,7 @@ class ProcResult:
     code: int
     output: str
     timed_out: bool = False
+    output_complete: bool = True
 
 
 async def run_proc(
@@ -372,7 +503,7 @@ async def run_proc(
     if cwd is None:
         raise Blocked("unguarded_access", f"{argv[0]} was about to be started without a verified working directory.")
     cwd = active("execution").launch_dir(cwd)
-    common = dict(
+    common: dict[str, Any] = dict(
         cwd=str(cwd) if cwd else None,
         env=env,
         stdin=asyncio.subprocess.DEVNULL,
@@ -380,43 +511,80 @@ async def run_proc(
         stderr=asyncio.subprocess.STDOUT,
         limit=4 * 1024 * 1024,
     )
-    try:
-        if not WINDOWS:
-            proc = await asyncio.create_subprocess_exec(*argv, start_new_session=True, **common)
-        elif argv[0].lower().endswith((".bat", ".cmd")):
-            # Batch files (gradlew.bat) only run through cmd.exe. The shell variant wraps the whole
-            # line in one pair of quotes, which is the form cmd parses reliably.
-            proc = await asyncio.create_subprocess_shell(
-                _cmd_line(argv), creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, **common
-            )
-        else:
-            proc = await asyncio.create_subprocess_exec(
+    async def launch() -> asyncio.subprocess.Process:
+        try:
+            if not WINDOWS:
+                return await asyncio.create_subprocess_exec(*argv, start_new_session=True, **common)
+            if argv[0].lower().endswith((".bat", ".cmd")):
+                return await asyncio.create_subprocess_shell(
+                    _cmd_line(argv), creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, **common
+                )
+            return await asyncio.create_subprocess_exec(
                 *argv, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, **common
             )
-    except FileNotFoundError:
-        raise Blocked("execution_unavailable", f"Executable not found: {argv[0]}", "environment") from None
-    except OSError as e:
-        raise Blocked("execution_unavailable", f"Could not start {argv[0]}: {e}", "environment") from None
+        except FileNotFoundError:
+            raise Blocked("execution_unavailable", f"Executable not found: {argv[0]}", "environment") from None
+        except OSError as e:
+            raise Blocked("execution_unavailable", f"Could not start {argv[0]}: {e}", "environment") from None
+
+    launch_task = asyncio.create_task(launch())
+    try:
+        proc = await asyncio.shield(launch_task)
+    except asyncio.CancelledError:
+        # Retain ownership even when cancellation arrives before the handle.
+        proc = await _wait_cleanup(launch_task)
+        await _wait_cleanup(asyncio.create_task(_terminate(proc)))
+        raise
 
     chunks: list[str] = []
     size = 0
+    complete = True
+    in_key = False
+    pending_secret = False
 
     async def pump() -> None:
-        nonlocal size
+        nonlocal size, complete, in_key, pending_secret
         assert proc.stdout is not None
         while True:
             try:
                 raw = await proc.stdout.readline()
             except ValueError:  # a single line longer than the stream limit
-                continue
+                complete = False
+                # readline may have discarded the credential label but retained its
+                # unlabelled tail. Withhold the remaining stream, then drain it.
+                note = "[remaining output withheld: oversized line]\n"
+                chunks.append(note[:max(0, max_bytes - size)])
+                if on_line:
+                    on_line(note.rstrip("\n"))
+                if sink := _OUTPUT_SINK.get():
+                    sink(note.rstrip("\n"))
+                while await proc.stdout.read(65_536):
+                    pass
+                break
             if not raw:
                 break
             line = raw.decode("utf-8", "replace").replace("\r\n", "\n")
-            if size < max_bytes:
-                chunks.append(line)
-                size += len(line)
+            next_secret = bool(_PENDING_SECRET.search(line))
+            if pending_secret:
+                line = "[credential continuation withheld]\n"
+            pending_secret = next_secret
+            if "-----BEGIN " in line and "PRIVATE KEY-----" in line:
+                in_key = True
+            if in_key:
+                ending = "-----END " in line and "PRIVATE KEY-----" in line
+                line = "[private key withheld]\n"
+                in_key = not ending
+            line = sanitise(line)
+            remaining = max(0, max_bytes - size)
+            if len(line) > remaining:
+                complete = False
+            if remaining:
+                chunks.append(line[:remaining])
+            size += min(len(line), remaining)
             if on_line:
                 on_line(line.rstrip("\n"))
+            if sink := _OUTPUT_SINK.get():
+                sink(line.rstrip("\n"))
         await proc.wait()
 
     timed_out = False
@@ -426,10 +594,25 @@ async def run_proc(
         timed_out = True
         await _terminate(proc)
     except asyncio.CancelledError:
-        await asyncio.shield(_terminate(proc))
+        await _wait_cleanup(asyncio.create_task(_terminate(proc)))
+        raise
+    except BaseException:
+        await _wait_cleanup(asyncio.create_task(_terminate(proc)))
         raise
     code = proc.returncode if proc.returncode is not None else -1
-    return ProcResult(code=code, output="".join(chunks), timed_out=timed_out)
+    if proc.returncode is None:
+        raise Blocked("termination_unconfirmed", "The owned process has not exited; its result is not final.", "environment")
+    return ProcResult(code=code, output="".join(chunks), timed_out=timed_out, output_complete=complete)
+
+
+async def _wait_cleanup(task: asyncio.Task[Any]) -> Any:
+    """Do not abandon owned launch/termination on repeated transport cancellation."""
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise Blocked("termination_unconfirmed", "Owned cleanup was interrupted; no final exit is verified.", "environment") from None
 
 
 def _cmd_line(argv: list[str]) -> str:
@@ -447,25 +630,32 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
     """Stop the process and everything it started. POSIX: SIGTERM the process group, then
     SIGKILL if it hasn't gone within a few seconds. Windows: taskkill the process tree."""
     if WINDOWS:
+        tree_stopped = False
         try:
             killer = await asyncio.create_subprocess_exec(
                 "taskkill", "/T", "/F", "/PID", str(proc.pid),
                 stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
-            await killer.wait()
+            tree_stopped = await killer.wait() == 0
         except OSError:
             try:
                 proc.kill()
             except ProcessLookupError:
-                return
+                pass
         try:
             await asyncio.wait_for(proc.wait(), 10)
         except asyncio.TimeoutError:
-            pass
+            raise Blocked("termination_unconfirmed", "Windows did not confirm the owned process stopped.", "environment")
+        if not tree_stopped:
+            raise Blocked("termination_unconfirmed", "Windows did not confirm the owned process tree stopped. Parent exit alone is insufficient.", "environment")
         return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
+        try:
+            await asyncio.wait_for(proc.wait(), 5)
+        except asyncio.TimeoutError:
+            raise Blocked("termination_unconfirmed", "The owned process could not be stopped.", "environment")
         return
     try:
         await asyncio.wait_for(proc.wait(), 5)
@@ -473,5 +663,8 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
-            return
-        await proc.wait()
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), 5)
+        except asyncio.TimeoutError:
+            raise Blocked("termination_unconfirmed", "The owned process did not confirm exit after SIGKILL.", "environment")
