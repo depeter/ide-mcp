@@ -35,9 +35,19 @@ Existing tests were extended. New tests are in `test_improvements.py`,
 `test_execution_improvements.py` and `test_semantic_improvements.py`.
 Final tool names, limits and request examples are documented in `README.md`.
 
+## Future validation runs
+
+Follow the temporary-directory rules in `C:\dev\scripts\ai\MCP_WORKFLOW.md`.
+Use a fresh directory under `%TEMP%` for each fixture run:
+
+```powershell
+$ValidationTemp = Join-Path $env:TEMP ('ide-mcp-validation-' + [guid]::NewGuid().ToString('N'))
+.\.venv\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider --basetemp "$ValidationTemp" -o faulthandler_timeout=30
+```
+
 ## Validation evidence
 
-Final complete fixture run:
+Final complete fixture run on 20 November 2026 (historical command):
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider --basetemp 'C:\dev\mcp\validation-delivery-20261120-d' -o faulthandler_timeout=30

@@ -339,7 +339,7 @@ def _same_file(a: Path, b: Path) -> bool:
         return False
 
 
-def write_changes(changes: list[FileChange]) -> None:
+def write_changes(changes: list[FileChange], before_write: Callable[[], None] | None = None) -> None:
     """Apply planned changes.
 
     Before the first write, every source and destination is validated against the request
@@ -365,6 +365,8 @@ def write_changes(changes: list[FileChange]) -> None:
             target = scope.check(c.new_path)
             if os.path.lexists(target) and not _same_file(path, target):
                 raise Blocked("destination_collision", f"{target} already exists, so {path.name} cannot be moved there. Nothing was written.", "input")
+    if before_write:
+        before_write()
     done: list[str] = []
     try:
         with contextlib.ExitStack() as stack:
@@ -411,6 +413,8 @@ class LspError(Blocked):
     matching instead; the reason code says what is missing."""
 
     def __init__(self, message: str, reason: str = "semantic_unavailable", category: str = "environment"):
+        if reason == "semantic_import_scope_unverified":
+            category = "policy"
         super().__init__(reason, message, category)
 
 
@@ -518,6 +522,7 @@ class Session:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     import_done: asyncio.Event = field(default_factory=asyncio.Event)
     import_status: str = ""
+    import_generation: int = 0  # changes on every backend import-state notification
     import_log: list[str] = field(default_factory=list)
     import_error: str = ""  # Gradle's "What went wrong" for a failed import
     broken_tasks: set[str] = field(default_factory=set)  # tasks whose module imported without sources
@@ -575,6 +580,9 @@ class Session:
                 "Nothing was changed, and no text match was substituted.",
                 "unsupported_operation",
             )
+        state, reason, detail = self.state(current)
+        if state != "ready":
+            raise LspError(detail or "Semantic coverage is not ready.", reason or "semantic_not_ready")
 
     def state(self, ident: Identity | None) -> tuple[str, str | None, str | None]:
         """Readiness of this session for the project `ident`, from what it has already reported."""
@@ -582,6 +590,11 @@ class Session:
             return "unavailable", "semantic_backend_exited", "The Kotlin language server process has exited."
         if self.ident is None or ident is None or self.ident != ident:
             return "unavailable", "semantic_session_mismatch", f"The running session is bound to {self.root}, not to this project."
+        if self.import_status == "SCOPE_UNVERIFIED":
+            return (
+                "unavailable", "semantic_import_scope_unverified",
+                f"The backend did not confirm an import of the selected project {self.root}. Its answers are not used.",
+            )
         if not self.import_done.is_set() or self.busy():
             return "indexing", "semantic_indexing", f"The Kotlin language server is still importing or indexing ({self.last_activity})."
         if why := self.unreliable():
@@ -597,13 +610,14 @@ class Session:
     async def request(self, method: str, params: Any, timeout: float = 120.0) -> Any:
         if method not in _LIFECYCLE:
             self.verify(method)
+        generation = self.import_generation
         self._next_id += 1
         rid = self._next_id
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
         self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
         try:
-            return await asyncio.wait_for(fut, timeout)
+            result = await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
             self._pending.pop(rid, None)
             try:
@@ -611,6 +625,11 @@ class Session:
             except LspError:
                 pass
             raise LspError(f"The Kotlin language server did not answer {method} within {timeout:.0f}s.") from None
+        if method not in _LIFECYCLE:
+            self.verify(method)
+            if generation != self.import_generation:
+                raise LspError("The backend import changed during the request. Query again.", "semantic_import_changed", "input")
+        return result
 
     async def _read_loop(self) -> None:
         out = self.proc.stdout
@@ -694,9 +713,35 @@ class Session:
                 self.import_log.append(line[:300])
                 del self.import_log[:-40]
                 self.last_activity = line[:120]
-        elif method == "intellij/workspaceImportState" and params.get("phase") == "FINISHED":
-            statuses = {f.get("status") for f in params.get("folders") or []}
-            self.import_status = "SUCCESS" if statuses <= {"SUCCESS"} else ", ".join(sorted(str(s) for s in statuses))
+        elif method == "intellij/workspaceImportState" and params.get("phase") != "FINISHED":
+            self.import_generation += 1
+            self.import_status = str(params.get("phase") or "UNKNOWN")
+            if self.import_status == "IN_PROGRESS":
+                self.import_done.clear()
+                self.import_error = ""
+                self._after_went_wrong = False
+                self.broken_tasks.clear()
+                self.import_log.clear()
+                self.last_activity = "importing"
+            else:
+                self.import_done.set()
+        elif method == "intellij/workspaceImportState":
+            self.import_generation += 1
+            # One workspace folder was requested. Success for another checkout, or an empty
+            # report, is not evidence that this worktree's sources were imported.
+            self.import_status = "SCOPE_UNVERIFIED"
+            folders = params.get("folders")
+            if isinstance(folders, list) and len(folders) == 1 and isinstance(folders[0], dict):
+                uri = folders[0].get("folderUri")
+                try:
+                    parsed = urlparse(uri) if isinstance(uri, str) else None
+                    if (parsed and parsed.scheme == "file" and parsed.netloc in ("", "localhost")
+                            and parsed.path.startswith("/") and not parsed.params and not parsed.query and not parsed.fragment):
+                        path = path_of(uri)
+                        if path.is_absolute() and self.ident and path_key(os.path.realpath(path)) == self.ident.path:
+                            self.import_status = str(folders[0].get("status") or "UNKNOWN")
+                except (OSError, ValueError):
+                    pass
             self._imported_at = time.time()
             self.import_done.set()
 

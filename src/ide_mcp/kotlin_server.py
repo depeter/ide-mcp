@@ -1164,8 +1164,10 @@ def _completeness(s: lsp.Session, reached_end: bool) -> tuple[bool, str, str]:
     return True, "", ""
 
 
-def _mutation_ready(s: lsp.Session, variant: str | None = None) -> None:
+def _mutation_ready(s: lsp.Session, variant: str | None = None, generation: int | None = None) -> None:
     s.verify("textDocument/rename")
+    if generation is not None and generation != s.import_generation:
+        raise Blocked("semantic_import_changed", "The backend import changed during the rename. Nothing was written. Preview again.", "input")
     state, reason, detail = s.state(identity(s.root))
     if state != "ready":
         raise Blocked(reason or "semantic_not_ready", detail or "Semantic coverage is not ready.")
@@ -1173,13 +1175,13 @@ def _mutation_ready(s: lsp.Session, variant: str | None = None) -> None:
         raise Blocked("incomplete_semantic_coverage", "Rename is blocked by partial semantic coverage, including omitted test components.")
     if variant or any((d / "src" / "main" / "AndroidManifest.xml").is_file()
                       for d in gradle.module_dirs(s.root).values()):
-        raise Blocked("semantic_variant_unverified", "The backend has no verified Android variant selector. Variant-sensitive rename is blocked.")
+        raise Blocked("semantic_variant_unverified", "The session's Android variant and cross-variant coverage are unverified. Variant-sensitive rename is blocked.")
 
 
 def _semantic_page(s: lsp.Session, rows: list[Any], offset: int, limit: int,
                    query_id: str | None, selection: str) -> tuple[list[Any], bool, str, str]:
     documents = [(uri, version, lsp._sha(text)) for uri, (version, text) in sorted(s._open.items())]
-    binding = [str(identity(s.root)), s.started, s.caveat(), selection, documents, rows]
+    binding = [str(identity(s.root)), s.started, s.import_generation, s.caveat(), selection, documents, rows]
     digest = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
     if offset and query_id != digest:
         raise Blocked("stale_continuation", "Continue with the query_id of the same session, symbol and result set. Query again after a change.", "input")
@@ -1342,6 +1344,7 @@ async def rename_symbol(
     async with s.lock:
         await s.sync()
         _mutation_ready(s, variant)
+        generation = s.import_generation
         path, pos = await _locate(s, name, file, line, column)
         s.open(path)
         doc = {"textDocument": {"uri": lsp.uri_of(path)}, "position": pos}
@@ -1376,6 +1379,7 @@ async def rename_symbol(
         documents = dict(s._open)
         edit = await s.request("textDocument/rename", {**doc, "newName": new_name}, timeout=300)
         changes = await asyncio.to_thread(lsp.plan_workspace_edit, edit or {}, documents)
+        _mutation_ready(s, variant, generation)
         if not changes:
             return guard.outcome("not_run", f"Renaming '{name}' to '{new_name}' changes nothing.", reason="no_occurrences", category="input")
 
@@ -1416,7 +1420,7 @@ async def rename_symbol(
 
         if sum(len(c.changed_lines()) for c in changes) > 150 or sum(len(c.new_text or "") for c in changes) > 500_000:
             raise Blocked("preview_too_large", "The complete rename preview exceeds its review bound. Narrow the refactoring.", "input")
-        digest = lsp.plan_digest(changes, str(identity(s.root)), str(s.started), key, name, new_name)
+        digest = lsp.plan_digest(changes, str(identity(s.root)), str(s.started), str(generation), key, name, new_name)
         focused_diff = "".join(
             "".join(difflib.unified_diff((c.old_text or "").splitlines(keepends=True),
                                        (c.new_text or "").splitlines(keepends=True),
@@ -1439,10 +1443,10 @@ async def rename_symbol(
                     "Nothing was written. Preview again and review the new edit set.",
                     "input",
                 )
-            _mutation_ready(s, variant)
+            _mutation_ready(s, variant, generation)
             if documents != s._open:
                 raise Blocked("stale_document", "The engine document state changed after planning.", "input")
-            await asyncio.to_thread(lsp.write_changes, changes)
+            await asyncio.to_thread(lsp.write_changes, changes, before_write=lambda: _mutation_ready(s, variant, generation))
             s.forget_open()
 
     total = sum(len(c.changed_lines()) for c in changes)

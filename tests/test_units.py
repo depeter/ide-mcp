@@ -433,11 +433,12 @@ def test_plan_and_write_workspace_edit(tmp_path: Path):
 
 def test_session_reports_partial_import(tmp_path: Path):
     from ide_mcp import lsp
+    from ide_mcp.common import identity
 
-    s = lsp.Session(root=tmp_path, proc=None)  # type: ignore[arg-type]
+    s = lsp.Session(root=tmp_path, proc=None, ident=identity(tmp_path))  # type: ignore[arg-type]
     assert s.unreliable() == ""
     s._handle({"method": "intellij/importLog", "params": {"message": "Querying the mapped value of x before task ':app:generateDebugAndroidTestBuildConfig' has completed is not supported"}})
-    s._handle({"method": "intellij/workspaceImportState", "params": {"phase": "FINISHED", "folders": [{"status": "SUCCESS"}]}})
+    s._handle({"method": "intellij/workspaceImportState", "params": {"phase": "FINISHED", "folders": [{"folderUri": tmp_path.as_uri(), "status": "SUCCESS"}]}})
     assert ":app" in s.unreliable() and "issues/253" in s.unreliable()
 
 

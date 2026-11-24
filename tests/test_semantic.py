@@ -367,10 +367,10 @@ def test_file_changed_between_planning_and_writing_rejects_before_the_first_writ
     use = door(a).parent / "Use.kt"
     real_write = lsp.write_changes
 
-    def edit_then_write(changes):
+    def edit_then_write(changes, **kwargs):
         use.write_text(USE + "// raced\n")
         effects.events.clear()
-        return real_write(changes)
+        return real_write(changes, **kwargs)
 
     monkeypatch.setattr(lsp, "write_changes", edit_then_write)
     e = error(_apply(a, pid))

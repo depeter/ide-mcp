@@ -357,10 +357,15 @@ def ignored_entries(root: Path, entries: list[Path]) -> set[str]:
             input=b"\0".join(os.fsencode(str(e)) for e in entries) + b"\0",
             capture_output=True, timeout=10, stdin=None, check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        raise Blocked("ignore_policy_unavailable", "Git ignore policy could not be checked.", "environment") from None
+    except (OSError, subprocess.TimeoutExpired) as e:
+        detail = str(e)
+        if isinstance(e, subprocess.TimeoutExpired) and e.stderr:
+            detail += "\n" + e.stderr.decode("utf-8", "replace")
+        raise Blocked("ignore_policy_unavailable", detail, "environment") from e
     if p.returncode not in (0, 1):
-        raise Blocked("ignore_policy_unavailable", "Git ignore policy could not be checked.", "environment")
+        raise Blocked("ignore_policy_unavailable",
+                      f"git check-ignore exited with status {p.returncode}.\n" + p.stderr.decode("utf-8", "replace"),
+                      "environment")
     return {path_key(os.fsdecode(e)) for e in p.stdout.split(b"\0") if e}
 
 
