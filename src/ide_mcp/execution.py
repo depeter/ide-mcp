@@ -7,6 +7,7 @@ import errno
 import hashlib
 import os
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -41,12 +42,25 @@ def source_identity(root: Path) -> dict[str, Any]:
         return {"sha": None, "dirty": None, "stability": "unverified"}
 
 
+def _runtime_scope(scope: guard.Scope, root: Path) -> guard.Scope:
+    """Keep execution bookkeeping in a guarded temporary directory, never a worktree."""
+    root = scope.dir(root)
+    temporary = guard.Scope.of(tempfile.gettempdir())
+    if temporary.worktree is not None or common.within(temporary.root, scope.worktree or root):
+        raise Blocked("temporary_directory_in_workspace", "Select an operating-system temporary directory outside worktrees.", "environment")
+    # dover-gain-efficient: a stable path shares native locks across server processes.
+    key = hashlib.sha256(os.fsencode(os.path.normcase(str(root)))).hexdigest()
+    directory = temporary.make_dirs(temporary.root / "ide-mcp" / key)
+    return guard.Scope.of(str(directory))
+
+
 def save_artifact(text: str, *, output_scope: guard.Scope | None = None) -> dict[str, Any]:
-    """Persist only sanitised bytes in a validated output scope with a unique name."""
+    """Persist only sanitised bytes in temporary storage with a unique name."""
     scope = output_scope or active()
-    path = scope.check(scope.root / ".ide-mcp" / "logs" / f"{uuid.uuid4().hex}.safe.log")
     payload = sanitise(text).encode("utf-8")
     try:
+        scope = _runtime_scope(scope, scope.root)
+        path = scope.check(scope.root / "logs" / f"{uuid.uuid4().hex}.safe.log")
         scope.write_bytes(path, payload, expected_revision="-")
         own = sorted(path.parent.glob("*.safe.log"), key=lambda p: p.stat().st_mtime)
         for old in own[:-30]:
@@ -64,8 +78,8 @@ class WorkspaceLease:
         self.root, self.fd = root, None
 
     async def __aenter__(self):
-        scope = active()
-        path = scope.check(self.root / ".ide-mcp" / "validation.lock")
+        scope = _runtime_scope(active(), self.root)
+        path = scope.check(scope.root / "validation.lock")
         scope.make_dirs(path.parent)
         self.fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
         try:

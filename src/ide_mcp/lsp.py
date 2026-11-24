@@ -28,6 +28,8 @@ from urllib.parse import unquote, urlparse
 
 from .common import (
     _PENDING_SECRET,
+    MAX_FILES,
+    SKIP_DIRS,
     WINDOWS,
     Blocked,
     Identity,
@@ -37,8 +39,10 @@ from .common import (
     active,
     clip,
     identity,
+    is_link,
     iter_files,
     path_key,
+    protected_name,
     sanitise,
 )
 from .guard import SEMANTIC
@@ -432,6 +436,65 @@ class LspError(Blocked):
         super().__init__(reason, message, category)
 
 
+def import_fingerprint(root: Path) -> str:
+    """Hash scoped build inputs, including ignored configuration but excluding generated output.
+
+    Protected properties and local binary dependencies use metadata only. Their contents are
+    never opened. An incomplete or unreadable scan cannot establish import freshness.
+    """
+    scope = active(SEMANTIC)
+    root = scope.check_project(root)
+    paths: list[Path] = []
+    visited = 0
+
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    def metadata(path: Path) -> tuple[int, ...]:
+        info = scope.check(path, protected=False).stat()
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+    try:
+        for directory, children, names in os.walk(root, onerror=unreadable):
+            here = scope.dir(directory)
+            children[:] = sorted(name for name in children if name not in SKIP_DIRS)
+            visited += len(children) + len(names)
+            if visited > MAX_FILES:
+                raise ToolError("The import-input scan exceeded its work limit.")
+            for name in children:
+                child = here / name
+                scope.dir(child)
+                if is_link(child):
+                    raise ToolError("The import-input scan cannot expand linked directories.")
+            paths.extend(here / name for name in names)
+
+        builds = {path.parent for path in paths
+                  if path.name in ("settings.gradle", "settings.gradle.kts") and path.parent != root}
+        inputs: dict[str, str | tuple[int, ...]] = {}
+        for path in paths:
+            relative = path.relative_to(root)
+            name = path.name
+            if not (protected_name(name) or name.endswith((".gradle", ".gradle.kts", ".toml", ".lockfile", ".jar", ".aar"))
+                    or name in ("gradlew", "gradlew.bat", "pom.xml", "ivy.xml", "verification-metadata.xml")
+                    or ".mvn" in relative.parts or "buildSrc" in relative.parts
+                    or any(build in path.parents for build in builds)):
+                continue
+            resolved = scope.check(path, protected=False)
+            before = metadata(path)
+            if protected_name(name) or protected_name(resolved.name) or path.suffix in (".jar", ".aar"):
+                inputs[relative.as_posix()] = before
+            else:
+                inputs[relative.as_posix()] = hashlib.sha256(scope.read_bytes(path, 8_000_000)).hexdigest()
+            if before != metadata(path):
+                raise ToolError("An import input changed during the freshness check.")
+    except Blocked:
+        raise
+    except (OSError, ToolError) as error:
+        raise LspError(f"Import inputs could not be verified: {error}",
+                       "semantic_import_inputs_unverified", "input") from None
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
 # Requests that manage the server process rather than ask about source code.
 _LIFECYCLE = ("initialize", "shutdown")
 # Which advertised capability each source request depends on.
@@ -601,6 +664,7 @@ class Session:
     _pending: dict[int, asyncio.Future] = field(default_factory=dict)
     _open: dict[str, tuple[int, str]] = field(default_factory=dict)  # uri -> (version, text)
     _mtimes: dict[str, float] | None = None
+    _import_fingerprint: str | None = None  # captured before initialise; None means invalidated or unverified
     _reader: asyncio.Task | None = None
     _stderr_reader: asyncio.Task[None] | None = None
     stderr_log: str = ""
@@ -671,6 +735,9 @@ class Session:
         if why := self.unreliable():
             return "unavailable", "semantic_import_failed", why
         if self.import_status == "SUCCESS":
+            if self._import_fingerprint is None:
+                return ("unknown", "semantic_import_inputs_unverified",
+                        "The current model has no verified import-input snapshot. Request a fresh session.")
             return "ready", None, None
         return (
             "unknown",
@@ -681,6 +748,7 @@ class Session:
     async def request(self, method: str, params: Any, timeout: float = 120.0) -> Any:
         if method not in _LIFECYCLE:
             self.verify(method)
+            await asyncio.to_thread(self.verify_import_inputs)
         generation = self.import_generation
         self._next_id += 1
         rid = self._next_id
@@ -699,6 +767,7 @@ class Session:
             self._pending.pop(rid, None)
         if method not in _LIFECYCLE:
             self.verify(method)
+            await asyncio.to_thread(self.verify_import_inputs)
             if generation != self.import_generation:
                 raise LspError("The backend import changed during the request. Query again.", "semantic_import_changed", "input")
         return result
@@ -1028,6 +1097,24 @@ class Session:
 
     # ---- keeping the server's view of files current
 
+    def invalidate_import_inputs(self) -> None:
+        """Keep stale models blocked even if the backend later reports a successful import."""
+        if self._import_fingerprint is not None:
+            self.import_generation += 1
+            self._import_fingerprint = None
+
+    def verify_import_inputs(self) -> None:
+        """Reject answers or writes if their model's import inputs are no longer current."""
+        try:
+            current = import_fingerprint(self.root)
+        except ToolError:
+            self.invalidate_import_inputs()
+            raise
+        if self._import_fingerprint is None or self._import_fingerprint != current:
+            self.invalidate_import_inputs()
+            raise LspError("Build inputs changed. A fresh project import is required; retry the operation.",
+                           "semantic_import_inputs_changed", "input")
+
     def _scan(self) -> dict[str, float]:
         out = {}
         for f in iter_files(self.root):
@@ -1041,6 +1128,7 @@ class Session:
     async def sync(self) -> None:
         """Tell the server about files that changed on disk since the last call. Agents edit
         files behind its back, so nothing else would."""
+        await asyncio.to_thread(self.verify_import_inputs)
         self.write_init_script()
         current = await asyncio.to_thread(self._scan)
         if self._mtimes is not None:
@@ -1167,10 +1255,28 @@ async def session_for(root: Path, timeout: float = 600.0, on_status: Callable[[s
                 s = None
             if variant is None and s is not None:
                 variant = s.variant
+            try:
+                fingerprint = await asyncio.to_thread(import_fingerprint, root)
+            except ToolError:
+                if s is not None:
+                    s.invalidate_import_inputs()
+                raise
+            if s is not None and s.alive and s._import_fingerprint != fingerprint:
+                s.invalidate_import_inputs()
+                if s.lock.locked() or s.busy() or not s.import_done.is_set():
+                    raise LspError("Build inputs changed during an operation or import. It was not terminated. Retry when it finishes.",
+                                   "semantic_import_inputs_changed", "input")
+                if on_status:
+                    on_status("Kotlin language server: restarting after build-input changes")
+                # dover-gain-efficient: restart rather than rely on an unverified backend reload command.
+                await _discard(key, s, quietly=False)
+                s = None
             binding = key if variant is None else key + "\0" + variant
+            binding += "\0" + fingerprint
             system = cache_dir() / "lsp" / hashlib.sha256(binding.encode()).hexdigest()[:16]
             if s is None or not s.alive:
                 s = await _start(root, launcher, system, variant=variant) if variant is not None else await _start(root, launcher, system)
+                s._import_fingerprint = fingerprint
                 _sessions[key] = s
                 try:
                     await s.initialize()
@@ -1187,6 +1293,7 @@ async def session_for(root: Path, timeout: float = 600.0, on_status: Callable[[s
                 on_status(f"Kotlin language server: {s.last_activity}")
             await asyncio.wait([waiter], timeout=2)
         await waiter
+        await asyncio.to_thread(s.verify_import_inputs)
         # Kotlin/kotlin-lsp#253: import again without the test components that broke it. The
         # choice is remembered per project, so this double import happens once.
         extra = components_to_disable(s.broken_tasks) - s.workaround

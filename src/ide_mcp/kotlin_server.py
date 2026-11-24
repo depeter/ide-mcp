@@ -1168,6 +1168,7 @@ def _completeness(s: lsp.Session, reached_end: bool) -> tuple[bool, str, str]:
 
 def _mutation_ready(s: lsp.Session, variant: str | None = None, generation: int | None = None) -> None:
     s.verify("textDocument/rename")
+    s.verify_import_inputs()
     if generation is not None and generation != s.import_generation:
         raise Blocked("semantic_import_changed", "The backend import changed during the rename. Nothing was written. Preview again.", "input")
     state, reason, detail = s.state(identity(s.root))

@@ -44,7 +44,7 @@ class FakeProc:
 
 def fake_session(root: Path, *, responses: dict | None = None, status: str = "SUCCESS", done: bool = True, capabilities: dict | None = None):
     """A Session bound to `root` whose transport records what is sent and answers from `responses`."""
-    from ide_mcp import lsp
+    from ide_mcp import guard, lsp
     from ide_mcp.common import identity
 
     class Recording(lsp.Session):
@@ -57,6 +57,8 @@ def fake_session(root: Path, *, responses: dict | None = None, status: str = "SU
                 asyncio.get_running_loop().call_soon(self._handle, {"id": message["id"], "result": answer})
 
     s = Recording(root=root, proc=FakeProc(), ident=identity(root))  # type: ignore[arg-type]
+    with guard.activate(guard.Scope.of(str(root))):
+        s._import_fingerprint = lsp.import_fingerprint(root)
     s.sent = []
     s.import_status = status
     s.capabilities = READY_CAPABILITIES if capabilities is None else capabilities
@@ -121,6 +123,7 @@ def test_session_bound_to_another_worktree_is_never_queried(worktrees, lsp_env, 
 
     async def scenario():
         wrong = fake_session(b)
+        effects.events.clear()  # The fake backend's initial import is fixture setup, not a request for A.
         lsp._sessions[lsp.session_key(a)] = wrong
         results = []
         for call in semantic_calls(a).values():

@@ -214,7 +214,8 @@ results. Credential labels, payment-related identifiers and URLs do not trigger 
 Scope checks, output limits and the prohibition on accessing `*.properties` files still apply.
 Command and validation output remains sanitised.
 
-New logs are sanitised, run-owned artifacts under the selected scope's `.ide-mcp/logs`.
+New logs are sanitised, run-owned artifacts under the operating system's temporary directory
+in `ide-mcp/<scope-path-hash>/logs`. They are never written into the selected worktree.
 Use `read_artifact` with the returned path, SHA-256 and `output_scope` as `expected_root`.
 This route rejects changed artifacts and older raw logs. Artifact write failure is reported
 separately; a missing log is never returned as a verified path.
@@ -422,13 +423,16 @@ fallback, app termination, restart or live UI check is performed.
 | `job_status`, `job_output`, `cancel_job`, `job_result`, `read_artifact` | Shared scoped lifecycle and sanitised output retrieval |
 
 Gradle output is reduced to what matters: outcome, failed tasks, located errors, test results
-and Gradle's "What went wrong". Sanitised logs use unique names under the selected scope's
-`.ide-mcp/logs/` (last 30). Final sanitised bytes are hashed. Recognised credential/private-key
-payloads are redacted and recognised payment lines are withheld before clipping or progress.
+and Gradle's "What went wrong". Sanitised logs use unique names under the operating system's
+temporary `ide-mcp/<scope-path-hash>/logs/` directory (last 30 per scope).
+Final sanitised bytes are hashed. Recognised credential/private-key payloads are redacted
+and recognised payment lines are withheld before clipping or progress.
 This is not certification for arbitrary payment traces; do not supply unknown sensitive formats.
 
 Gradle execution and report capture hold a native workspace file lease across server
-processes. Reports are checked before/after the run while the lease is held. Unchanged
+processes. Its `validation.lock` stays in temporary `ide-mcp/<project-path-hash>/`, not the
+worktree. The lock file remains after release so competing processes use the same file.
+Reports are checked before/after the run while the lease is held. Unchanged
 reports from executed tasks are unverified; cached/up-to-date evidence is labelled reused,
 not fresh execution. Counts come from actual test cases, excluding skips. Known failures
 remain failures when other reports are incomplete. Focused compilation retains sibling
@@ -461,6 +465,11 @@ returns `cursor_expired` with the retained starting cursor. Each job retains at 
 1,000,000 characters. At most eight jobs are active and 64 are retained. Finished jobs
 expire 30 minutes after creation. Run-owned report directories are left for explicit
 user cleanup; only `.safe.log` retention is automatic.
+
+Logs and workspace locks require access to the operating system's temporary directory.
+If `IDE_MCP_ALLOWED_ROOTS` is set, include that directory in the allowlist.
+Denied temporary storage never falls back to the worktree. Validation reports and explicitly
+selected build-output locations are unchanged.
 
 Jobs are in memory. Client disconnect does not relaunch work. Server exit loses job
 metadata. Cooperative task cancellation waits for owned termination, but server shutdown
@@ -515,6 +524,29 @@ How it behaves:
   the reason; none of them uses text.
 - Android results describe the current imported variant. `rename_symbol(variant="paidDebug")`
   selects a variant for that import. Omitting it reuses the current model or the backend default.
+
+### Import freshness
+
+Before reusing a session, the server checks build inputs inside the selected project.
+It monitors Gradle scripts, TOML catalogues, lockfiles, wrappers, Maven configuration,
+local JAR/AAR metadata, `buildSrc` and files in nested Gradle builds with their own settings.
+Ignored configuration is included. Generated output and cache directories are excluded.
+Text inputs are checked by content hash. Protected `*.properties` files and local JAR/AAR
+dependencies are checked by file identity, size and timestamps only. Their contents are never read.
+Changes that preserve all metadata of these inputs cannot be detected.
+
+Changed inputs invalidate the model. An idle session is stopped and replaced.
+The replacement keeps the selected variant and uses an input-bound backend cache directory.
+Old cache directories are retained. A successful import of the selected project is still
+required before semantic answers or rename writes are permitted.
+Changes during a query or rename preflight reject that operation. An active operation or
+import is not terminated for a refresh; retry after it finishes.
+Reviewed rename previews and semantic continuations do not survive a replacement.
+
+An incomplete, unreadable or out-of-scope input scan blocks semantic use.
+The `readiness` tool remains observational; it does not scan for new changes.
+Inputs outside the selected project, including user-level Gradle/Maven configuration,
+remote dependency changes and arbitrary files loaded by build scripts, are not monitored.
 
 ### Android projects
 
