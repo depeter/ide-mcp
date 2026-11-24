@@ -81,8 +81,8 @@ mcp = FastMCP(
         "separate, direct queries with bounded responses but unbounded backend collection; "
         "continuations require offset and query_id. They describe static relationships, not a runtime "
         "order, and do not follow chains. find_symbol and file_outline read source text and resolve "
-        "nothing. Partial imports and unverified Android model variants block rename before "
-        "preview or apply. Request contract 3.0 returns legacy text and structured schema 1.0. "
+        "nothing. Partial imports block rename before preview or apply. Android rename uses the "
+        "current imported variant, not every variant. Request contract 3.0 returns legacy text and structured schema 1.0. "
         "start_validation uses shared scoped jobs. Run compile after an authorised rename."
     ),
 )
@@ -986,13 +986,14 @@ def _require_server(alternative: str) -> None:
         raise lsp.LspError(lsp.NOT_INSTALLED + " " + alternative, "semantic_not_installed")
 
 
-async def _session(ctx: Context | None, root: Path, timeout: float = 600.0) -> lsp.Session:
+async def _session(ctx: Context | None, root: Path, timeout: float = 600.0,
+                   variant: str | None = None) -> lsp.Session:
     """The language server session for a verified project. Raises unless the session is bound
     to that project and has reported a complete import: answers from a session for another
     worktree would be about other code, and answers from an incomplete model look complete and
     are not. The state is established here on every call, never taken from an earlier one."""
     async with Progress(ctx) as p:
-        s = await lsp.session_for(root, timeout, lambda message: setattr(p, "last", message))
+        s = await lsp.session_for(root, timeout, lambda message: setattr(p, "last", message), variant=variant)
     state, reason, detail = s.state(identity(root))
     if state != "ready":
         raise lsp.LspError(
@@ -1002,14 +1003,15 @@ async def _session(ctx: Context | None, root: Path, timeout: float = 600.0) -> l
     return s
 
 
-async def _semantic(ctx: Context | None, root: str | None, file: str | None, alternative: str, *methods: str) -> lsp.Session:
+async def _semantic(ctx: Context | None, root: str | None, file: str | None, alternative: str,
+                    *methods: str, variant: str | None = None) -> lsp.Session:
     """Everything a code-aware operation checks before its first query: the targets, the
     project, an installed server, a ready session bound to that project, and backend support
     for each request the operation is going to make."""
     _source(file)  # a file to resolve the symbol in is a target too
     workspace = _workspace_root(root, file)
     _require_server(alternative)
-    s = await _session(ctx, workspace)
+    s = await _session(ctx, workspace, variant=variant)
     for method in methods:
         s.verify(method)
     return s
@@ -1173,9 +1175,11 @@ def _mutation_ready(s: lsp.Session, variant: str | None = None, generation: int 
         raise Blocked(reason or "semantic_not_ready", detail or "Semantic coverage is not ready.")
     if s.caveat() or s.broken_tasks:
         raise Blocked("incomplete_semantic_coverage", "Rename is blocked by partial semantic coverage, including omitted test components.")
-    if variant or any((d / "src" / "main" / "AndroidManifest.xml").is_file()
-                      for d in gradle.module_dirs(s.root).values()):
-        raise Blocked("semantic_variant_unverified", "The session's Android variant and cross-variant coverage are unverified. Variant-sensitive rename is blocked.")
+    # dover-gain-efficient: use one imported model like the IDE; add per-variant plans only for an all-variant contract.
+    if variant is not None and s.variant != variant:
+        raise Blocked("semantic_variant_unverified", "The current import does not match the requested Android variant.")
+    if s.variant is not None and (not s.variant_modules or any(v != s.variant for v in s.variant_modules.values())):
+        raise Blocked("semantic_variant_unverified", "The current import did not confirm the selected Android variant. No rename was planned or written.")
 
 
 def _semantic_page(s: lsp.Session, rows: list[Any], offset: int, limit: int,
@@ -1306,7 +1310,10 @@ async def rename_symbol(
         Field(description="The preview_id returned by the dry run, required with dry_run=false. The edit set is recomputed and applied only if it is identical to the one previewed."),
     ] = None,
     expected_root: ExpectedRoot = None,
-    variant: str | None = None,
+    variant: Annotated[
+        str | None,
+        Field(description="Optional Android variant to import. Omit to reuse the current model or the backend default. Inactive variants are not guaranteed."),
+    ] = None,
 ) -> str:
     """Rename a symbol everywhere it is used, with the language server's rename refactoring:
     only references to that one symbol change; same-named symbols, comments and strings are
@@ -1339,7 +1346,8 @@ async def rename_symbol(
             "use find_usages(engine='text'), which is read-only; a deliberate textual edit is a job for the files "
             "server's replace_text, one reviewed file at a time.",
         )
-    s = await _semantic(ctx, root, file, "Renaming needs it; no text replacement is made in its place.", "textDocument/rename")
+    s = await _semantic(ctx, root, file, "Renaming needs it; no text replacement is made in its place.",
+                        "textDocument/rename", variant=variant)
     cache: dict[str, list[str] | None] = {}
     async with s.lock:
         await s.sync()
@@ -1420,7 +1428,8 @@ async def rename_symbol(
 
         if sum(len(c.changed_lines()) for c in changes) > 150 or sum(len(c.new_text or "") for c in changes) > 500_000:
             raise Blocked("preview_too_large", "The complete rename preview exceeds its review bound. Narrow the refactoring.", "input")
-        digest = lsp.plan_digest(changes, str(identity(s.root)), str(s.started), str(generation), key, name, new_name)
+        digest = lsp.plan_digest(changes, str(identity(s.root)), str(s.started), str(generation), key, name, new_name,
+                                 json.dumps([s.variant, s.variant_modules], sort_keys=True))
         focused_diff = "".join(
             "".join(difflib.unified_diff((c.old_text or "").splitlines(keepends=True),
                                        (c.new_text or "").splitlines(keepends=True),
@@ -1453,6 +1462,7 @@ async def rename_symbol(
     complete, reason, note = _completeness(s, True)
     verb = "Would rename" if dry_run else "Renamed"
     out = [_provenance("semantic", engine, s.root, complete, reason), symbol]
+    out.append(f"Coverage: current imported project model (variant: {s.variant or 'backend default'}). Inactive Android variants are not guaranteed.")
     if note:
         out.append(note)
     out.append(f"{verb} '{name}' to '{new_name}': {total} line(s) in {len(changes)} file(s).")
@@ -1478,12 +1488,16 @@ async def rename_symbol(
             raise Blocked("preview_too_large", "The full rename preview exceeds 50,000 characters. No clipped preview can be applied.", "input")
         return guard.result(text, outcome="not_run", reason="dry_run", complete=complete,
                             data={"engine": "semantic", "project_root": str(s.root), "preview_id": digest,
-                                  "symbol": symbol, "variant": None, "edits": [
+                                  "symbol": symbol, "variant": s.variant, "variant_modules": dict(s.variant_modules),
+                                  "variant_coverage": "imported_model", "edits": [
                                       {"path": str(c.path), "destination": str(c.new_path) if c.new_path else None,
                                        "expected_revision": lsp._sha(c.old_text), "new_revision": lsp._sha(c.new_text),
                                        "document_version": c.document_version} for c in changes]})
     out.append(f"Applied the edit set previewed as {digest}. Run compile to verify.")
-    return guard.outcome("passed", clip("\n".join(out), 50_000, keep="head"))
+    return guard.result("[outcome=passed]\n" + clip("\n".join(out), 50_000, keep="head"), outcome="passed", complete=complete,
+                        data={"engine": "semantic", "project_root": str(s.root), "preview_id": digest,
+                              "symbol": symbol, "variant": s.variant, "variant_modules": dict(s.variant_modules),
+                              "variant_coverage": "imported_model"})
 
 
 # ----------------------------------------------------------------------------- flow navigation

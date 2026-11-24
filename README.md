@@ -310,7 +310,8 @@ returns `stale_continuation`. The response limit does not bound backend collecti
    SHA-256 as `expected_revision`. Review a complete `edit_files` preview before applying.
 7. Retain semantic `query_id` and job IDs with their selected scope. Poll jobs with backoff;
    consume output using the returned character cursor, then retrieve the final result.
-8. Do not apply a semantic rename on a partial import or unverified Android variant model.
+8. Do not apply a semantic rename on a partial import. Android rename uses the current imported
+   variant. It does not guarantee coverage of inactive variants.
 
 Binding the scope to the user's task, caching and any routing between tools remain client
 work and are not part of these servers.
@@ -507,8 +508,8 @@ How it behaves:
   `engine="text"` returns whole-word text matches, labelled as such on the first line.
   `rename_symbol`, `find_implementations`, `find_callers` and `find_callees` are blocked with
   the reason; none of them uses text.
-- The language server offers no way to choose an Android build variant, so results describe
-  whatever it imported.
+- Android results describe the current imported variant. `rename_symbol(variant="paidDebug")`
+  selects a variant for that import. Omitting it reuses the current model or the backend default.
 
 ### Android projects
 
@@ -519,9 +520,9 @@ In a single-module app that takes the whole project with it.
 
 The `kotlin` server works around it by itself. When an import fails that way, it imports again
 with the Android test components that caused it switched off, and remembers that for the
-project, so only the first call pays for two imports. Nothing in the project or in
-`~/.gradle` is changed: the switch is a Gradle init script handed to the language server's
-import alone, and ordinary builds never see it.
+project, so only the first call pays for two imports. No project settings are changed.
+The switch is a generated Gradle init script handed to the language server's import alone.
+Ordinary builds never see it.
 
 The sources of omitted components, normally `src/androidTest`, are invisible to the engine.
 Read-only results state partial coverage, and `file_problems` and `symbol_info` refuse files
@@ -529,9 +530,18 @@ in omitted components. A partial import blocks rename before an applicable previ
 A later compile is not a substitute for complete relevant semantic coverage. Set
 `KOTLIN_LSP_ANDROID_WORKAROUND=0` to disable the workaround.
 
-The backend has no verified Android semantic variant selector. Android mutation stays
-blocked unless the required imported-model relationship is established. Passing `variant`
-does not prove that relationship. Gradle validation's variant input is separate.
+Android rename uses one imported model, like IDE refactoring. It does not require proof of
+coverage across every variant. Preview and apply report `variant_coverage="imported_model"`.
+An omitted variant name is reported as `null`, not guessed from source folders or task names.
+
+An explicit `variant` is passed through the import process's `LSP_ANDROID_VARIANT`.
+An import-only init script checks that the requested variant is enabled in each Android
+module and that no `lsp.android.variant` property overrides it. Missing variants and conflicting
+overrides block the import. Rename also requires confirmation from that import.
+No properties files or machine-wide environment settings are changed.
+Changing the variant starts a fresh session and invalidates earlier previews.
+The current semantic operation or import must finish before its variant can change.
+Gradle validation's variant input remains separate from semantic import selection.
 
 Rename validates UTF-16 positions, engine document versions/bytes, session identity,
 declaration resolution, all file revisions and destinations. Unsupported resource creation

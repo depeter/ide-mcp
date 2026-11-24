@@ -110,8 +110,9 @@ matched diagnostic messages by file and rule. It is not a claim that warnings ar
 - .NET tests require one explicit literal target framework, pinned with `--framework`.
   Imported/conditional selection and unsupported multi-target coverage stay blocked.
   There is no snapshot fallback or application restart.
-- Partial semantic imports block rename before an applicable preview or write. The backend
-  has no verified Android semantic variant selector. A caller-supplied variant is not proof.
+- Partial semantic imports block rename before an applicable preview or write. Android rename
+  uses the current imported variant, not every variant. Explicit selection uses the LSP's native
+  selector and an import-only enabled-variant check. Each import must confirm that selection.
 - Query response bounds do not bound backend collection work. Dispatch labels are
   conservative declaration-text estimates, not runtime or exact-dispatch proof.
 - Multi-file edits are not atomic. Partial failures report completed and pending work.

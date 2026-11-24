@@ -447,6 +447,8 @@ _TOO_EARLY = re.compile(r"before task '(:[^']+)' has completed is not supported"
 
 WORKAROUND_ENV = "KOTLIN_LSP_ANDROID_WORKAROUND"  # "0" disables it
 INIT_SCRIPTS_PROPERTY = "com.jetbrains.ls.imports.gradle.init.scripts"
+VARIANT_ENV = "LSP_ANDROID_VARIANT"
+_VARIANT_CONFIRMATION = re.compile(r"^\[ide-mcp:variant\] (:[^=\s]*)=([A-Za-z][A-Za-z0-9_]*)$")
 _COMPONENT_SOURCES = {"androidTest": "src/androidTest", "unitTest": "src/test"}
 _DISABLE = {
     "androidTest": (
@@ -478,9 +480,15 @@ def components_to_disable(broken_tasks: set[str]) -> frozenset[str]:
     return frozenset(out)
 
 
-def init_script_text(components: frozenset[str]) -> str:
+def validate_variant(variant: str | None) -> None:
+    if variant is not None and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", variant):
+        raise LspError("variant must be a non-empty Android variant name, e.g. paidDebug.", "invalid_variant", "input")
+
+
+def init_script_text(components: frozenset[str], variant: str | None = None) -> str:
+    validate_variant(variant)
     body = "\n                    ".join(_DISABLE[c] for c in sorted(components))
-    return f"""// Written by ide-mcp for the Kotlin language server's project import only.
+    text = f"""// Written by ide-mcp for the Kotlin language server's project import only.
 // Works around https://github.com/Kotlin/kotlin-lsp/issues/253 by leaving out: {", ".join(sorted(components))}
 gradle.allprojects {{ project ->
     ['com.android.application', 'com.android.library', 'com.android.dynamic-feature'].each {{ id ->
@@ -495,6 +503,44 @@ gradle.allprojects {{ project ->
     }}
 }}
 """
+    if not components:
+        text = "// Written by ide-mcp for the Kotlin language server's project import only.\n"
+    if variant is not None:
+        selected = json.dumps(variant)
+        text += f"""
+def importedVariants = [:]
+gradle.allprojects {{ project ->
+    ['com.android.application', 'com.android.library', 'com.android.dynamic-feature'].each {{ id ->
+        project.pluginManager.withPlugin(id) {{
+            def components = project.extensions.findByName('androidComponents')
+            if (components == null) {{
+                throw new GradleException("Cannot verify Android variants in " + project.path)
+            }}
+            def available = [] as Set
+            importedVariants[project] = available
+            components.onVariants(components.selector().all()) {{ variant ->
+                available.add(variant.name)
+            }}
+        }}
+    }}
+}}
+gradle.projectsEvaluated {{
+    if (importedVariants.isEmpty()) {{
+        throw new GradleException("The requested Android variant requires an Android module.")
+    }}
+    importedVariants.each {{ project, available ->
+        def selected = project.providers.gradleProperty("lsp.android.variant")
+            .orElse(project.providers.systemProperty("lsp.android.variant"))
+            .orElse(project.providers.environmentVariable("LSP_ANDROID_VARIANT")).orNull
+        if (selected != {selected} || !available.contains({selected})) {{
+            throw new GradleException("Cannot select Android variant " + {selected} + " in " + project.path +
+                ". Check the enabled variants and lsp.android.variant overrides.")
+        }}
+        println("[ide-mcp:variant] " + project.path + "=" + {selected})
+    }}
+}}
+"""
+    return text
 
 
 def _read_marker(system: Path) -> frozenset[str]:
@@ -529,6 +575,8 @@ class Session:
     _after_went_wrong: bool = False
     workaround: frozenset[str] = frozenset()  # Android test components left out of the import
     init_script: Path | None = None
+    variant: str | None = None  # explicit import selection; None retains the backend's default
+    variant_modules: dict[str, str] = field(default_factory=dict)  # confirmed by the current import
     progress: dict[str, str] = field(default_factory=dict)
     _begun: dict[str, float] = field(default_factory=dict)  # when each open progress token started
     _imported_at: float = 0.0
@@ -703,6 +751,8 @@ class Session:
                 line = line.strip()
                 if not line or line.startswith("at "):
                     continue
+                if match := _VARIANT_CONFIRMATION.fullmatch(line):
+                    self.variant_modules[match[1]] = match[2]
                 # Known importer defect (Kotlin/kotlin-lsp#253): a module whose generated-source
                 # provider is read too early is imported with no sources at all.
                 if m := _TOO_EARLY.search(line):
@@ -722,6 +772,7 @@ class Session:
                 self._after_went_wrong = False
                 self.broken_tasks.clear()
                 self.import_log.clear()
+                self.variant_modules.clear()
                 self.last_activity = "importing"
             else:
                 self.import_done.set()
@@ -875,9 +926,10 @@ class Session:
             return
         try:
             self.init_script.parent.mkdir(parents=True, exist_ok=True)
-            self.init_script.write_text(init_script_text(self.workaround), encoding="utf-8")
-        except OSError:
-            pass
+            self.init_script.write_text(init_script_text(self.workaround, self.variant), encoding="utf-8")
+        except OSError as error:
+            if self.variant is not None:
+                raise LspError(f"Could not write the Android variant import check: {error}", "semantic_variant_unverified") from None
 
     async def stop(self) -> None:
         if self.alive:
@@ -998,20 +1050,21 @@ async def _discard(key: str, s: Session, *, quietly: bool) -> None:
         await s.stop()
 
 
-async def session_for(root: Path, timeout: float = 600.0, on_status: Callable[[str], None] | None = None) -> Session:
+async def session_for(root: Path, timeout: float = 600.0, on_status: Callable[[str], None] | None = None,
+                      *, variant: str | None = None) -> Session:
     """The language server for the verified project `root`, started and imported if necessary.
 
     A stored session is reused only if it is alive and still bound to this very directory;
     after a restart, a replaced backend or a directory swapped under the same path, a new one
     is started and its readiness established afresh."""
     global _reaper
+    validate_variant(variant)
     launcher = find_server()
     if launcher is None:
         raise LspError(NOT_INSTALLED, "semantic_not_installed")
     root = active(SEMANTIC).check_project(root)
     bound = identity(root)
     key = bound.path
-    system = cache_dir() / "lsp" / hashlib.sha256(key.encode()).hexdigest()[:16]
     deadline = time.time() + timeout
     while True:
         async with _start_locks.setdefault(key, asyncio.Lock()):
@@ -1019,8 +1072,18 @@ async def session_for(root: Path, timeout: float = 600.0, on_status: Callable[[s
             if s is not None and s.alive and s.ident != bound:
                 await _discard(key, s, quietly=True)
                 s = None
+            if s is not None and s.alive and variant is not None and s.variant != variant:
+                if s.lock.locked() or s.busy() or not s.import_done.is_set():
+                    raise LspError("The current semantic operation or import must finish before changing variant.",
+                                   "semantic_variant_busy", "input")
+                await _discard(key, s, quietly=False)
+                s = None
+            if variant is None and s is not None:
+                variant = s.variant
+            binding = key if variant is None else key + "\0" + variant
+            system = cache_dir() / "lsp" / hashlib.sha256(binding.encode()).hexdigest()[:16]
             if s is None or not s.alive:
-                s = await _start(root, launcher, system)
+                s = await _start(root, launcher, system, variant=variant) if variant is not None else await _start(root, launcher, system)
                 _sessions[key] = s
                 try:
                     await s.initialize()
@@ -1048,26 +1111,30 @@ async def session_for(root: Path, timeout: float = 600.0, on_status: Callable[[s
         await _discard(key, s, quietly=False)
 
 
-async def _start(root: Path, launcher: Path, system: Path) -> Session:
+async def _start(root: Path, launcher: Path, system: Path, *, variant: str | None = None) -> Session:
+    validate_variant(variant)
     root = active(SEMANTIC).launch_dir(root)  # verified again at the point of launch
     system.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
+    if variant is not None:
+        env[VARIANT_ENV] = variant
     workaround = _read_marker(system) if workaround_enabled() else frozenset()
     script: Path | None = None
-    if workaround:
-        script = system / "ide-mcp-import.gradle"
+    if workaround or variant is not None:
+        name = f"ide-mcp-import-{system.name}.gradle" if variant is not None else "ide-mcp-import.gradle"
+        script = system / name
         option = f"-D{INIT_SCRIPTS_PROPERTY}={script}"
         if any(ch.isspace() for ch in option):
             # The launcher splits IJ_JAVA_OPTIONS on whitespace. The server resolves a relative
             # path against its working directory, the project root, whose .gradle is scratch space.
-            script = root / ".gradle" / "ide-mcp-import.gradle"
-            option = f"-D{INIT_SCRIPTS_PROPERTY}=.gradle/ide-mcp-import.gradle"
+            script = root / ".gradle" / name
+            option = f"-D{INIT_SCRIPTS_PROPERTY}=.gradle/{name}"
         env["IJ_JAVA_OPTIONS"] = " ".join(filter(None, [env.get("IJ_JAVA_OPTIONS", "").strip(), option]))
     argv = [str(launcher), "--stdio", f"--system-path={system}"]
     if WINDOWS and launcher.suffix.lower() in (".bat", ".cmd"):
         argv = ["cmd.exe", "/c", *argv]
     kwargs: dict[str, Any] = {"start_new_session": True} if not WINDOWS else {}
-    s = Session(root=root, proc=None, ident=identity(root), workaround=workaround, init_script=script)  # type: ignore[arg-type]
+    s = Session(root=root, proc=None, ident=identity(root), workaround=workaround, init_script=script, variant=variant)  # type: ignore[arg-type]
     s.write_init_script()
     try:
         s.proc = await asyncio.create_subprocess_exec(
